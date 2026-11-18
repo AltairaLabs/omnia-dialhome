@@ -1,0 +1,4 @@
+/omnia-dialhome
+/out/
+*.test
+coverage.out
