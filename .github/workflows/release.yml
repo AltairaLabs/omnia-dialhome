@@ -7,6 +7,12 @@ name: Release image
 #   git tag v0.1.1 && git push origin v0.1.1
 #
 # workflow_dispatch republishes an existing tag, for a push that failed.
+# :latest moves only on a pushed release tag (no pre-release suffix), so a
+# republish or an -rc never moves it.
+#
+# A new GHCR package starts private. After the first publish, a package admin
+# makes it public once in the package settings; until then nothing outside
+# the organization can pull it.
 on:
   push:
     tags: ['v*']
@@ -41,6 +47,9 @@ jobs:
             exit 1
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          latest=false
+          if [ "$EVENT_NAME" = "push" ] && ! echo "$tag" | grep -q -- '-'; then latest=true; fi
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -63,7 +72,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: |
             ghcr.io/altairalabs/omnia-dialhome:${{ steps.meta.outputs.tag }}
-            ghcr.io/altairalabs/omnia-dialhome:latest
+            ${{ steps.meta.outputs.latest == 'true' && 'ghcr.io/altairalabs/omnia-dialhome:latest' || '' }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.meta.outputs.tag }}
