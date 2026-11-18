@@ -29,15 +29,18 @@ You need the dial-home URL and key Omnia issued for the agent (Omnia keeps
 them in the `<agent>-dial-home-key` Secret, keys `url` and `key`), and a
 compiled PromptPack.
 
+Each `v*` tag publishes `ghcr.io/altairalabs/omnia-dialhome:<tag>` for
+`linux/amd64` and `linux/arm64`. To build it yourself, `docker build -t
+omnia-dialhome .`.
+
 ```bash
-docker build -t omnia-dialhome .
 docker run --rm \
   -v "$PWD/agent.pack.json:/pack/agent.pack.json:ro" \
   -e OMNIA_DIALHOME_PACK=/pack/agent.pack.json \
   -e OMNIA_DIALHOME_PROMPT=assistant \
   -e OMNIA_DIAL_HOME_URL=wss://my-agent-dial-home.example.com/v1/channel \
   -e OMNIA_DIAL_HOME_KEY="$KEY" \
-  omnia-dialhome
+  ghcr.io/altairalabs/omnia-dialhome:v0.1.1
 ```
 
 | Variable | Flag | Meaning |
@@ -45,10 +48,29 @@ docker run --rm \
 | `OMNIA_DIAL_HOME_URL` | | The relay's `wss://…/v1/channel` URL. Required |
 | `OMNIA_DIAL_HOME_KEY` | | The agent's dial-home key. Required |
 | `OMNIA_DIAL_HOME_CONFIG` | | Provider configuration, as JSON, to use while the channel is down. Optional |
-| `OMNIA_DIALHOME_PACK` | `-pack` | The compiled `.pack.json`. Required |
-| `OMNIA_DIALHOME_PROMPT` | `-prompt` | The pack prompt to run. Required |
+| `OMNIA_DIALHOME_PACK` | `-pack` | The compiled `.pack.json`. Required, unless a deploy hands the pack over (below) |
+| `OMNIA_DIALHOME_PROMPT` | `-prompt` | The pack prompt to run. Required, unless a deploy hands the agent over (below) |
 | `OMNIA_DIALHOME_CLIENT_TOOLS` | `-client-tools` | Comma-separated pack tools the caller's client runs |
-| `PORT` | | When set, serves `/healthz` (process up) and `/readyz` (channel connected) |
+| `OMNIA_DIALHOME_PORT` | | When set, serves `/healthz` (process up) and `/readyz` (channel connected) on this port |
+| `PORT` | | The same, when `OMNIA_DIALHOME_PORT` is not set |
+
+### Deployed by PromptArena
+
+PromptArena's deploy adapters can run this image in place of their own runtime
+through the deploy config's `runtime_override` block. The adapter then hands
+the container the pack and the agent, and the command reads them when its own
+settings are absent:
+
+| Variable | Used as |
+|---|---|
+| `PROMPTPACK_PACK_JSON` | The pack, when neither `-pack` nor `OMNIA_DIALHOME_PACK` is set |
+| `PROMPTPACK_AGENT` | The prompt, when neither `-prompt` nor `OMNIA_DIALHOME_PROMPT` is set |
+
+A pack the adapter staged to storage instead (`PROMPTPACK_PACK_URI`, for packs
+too large to pass inline) is refused with an error naming the URI. Build an
+image `FROM` this one with the pack copied in, and set `OMNIA_DIALHOME_PACK`.
+The adapter's other variables are ignored: the model provider comes from
+Omnia, as below. The [Vertex adapter](https://github.com/AltairaLabs/promptarena-deploy-vertex#run-omnia-dialhome) README shows a complete configuration.
 
 The model provider comes from Omnia: while the channel is up the relay serves
 the agent's providers, and the runtime builds the default one, with its

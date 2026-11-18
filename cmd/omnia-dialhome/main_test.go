@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -33,6 +34,47 @@ func TestParse(t *testing.T) {
 
 	_, err = parse(nil, env(nil))
 	assert.Error(t, err)
+}
+
+// A PromptKit deploy adapter that runs this image in place of its runtime
+// hands over the pack and agent under its own names.
+func TestParse_DeployHandoff(t *testing.T) {
+	o, err := parse(nil, env(map[string]string{
+		"PROMPTPACK_PACK_JSON": `{"id":"p"}`, "PROMPTPACK_AGENT": "assistant",
+		"OMNIA_DIALHOME_PORT": "8080", "PORT": "9090",
+	}))
+	require.NoError(t, err)
+	assert.Equal(t, options{packJSON: `{"id":"p"}`, prompt: "assistant", port: "8080"}, o)
+
+	// The command's own settings win over the handoff.
+	o, err = parse([]string{"-prompt", "other"}, env(map[string]string{
+		"OMNIA_DIALHOME_PACK": "a.pack.json", "PROMPTPACK_PACK_JSON": `{"id":"p"}`, "PROMPTPACK_AGENT": "assistant",
+	}))
+	require.NoError(t, err)
+	assert.Equal(t, "a.pack.json", o.pack)
+	assert.Empty(t, o.packJSON)
+	assert.Equal(t, "other", o.prompt)
+
+	_, err = parse(nil, env(map[string]string{
+		"PROMPTPACK_PACK_URI": "gs://b/p.json", "PROMPTPACK_AGENT": "assistant",
+	}))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "gs://b/p.json")
+	assert.Contains(t, err.Error(), "not supported")
+}
+
+func TestWritePack(t *testing.T) {
+	path, cleanup, err := writePack(`{"id":"p"}`)
+	require.NoError(t, err)
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, `{"id":"p"}`, string(got))
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	cleanup()
+	_, err = os.Stat(path)
+	assert.True(t, os.IsNotExist(err), "cleanup removes the pack")
 }
 
 func TestRun_RefusesWhatItCannotRun(t *testing.T) {

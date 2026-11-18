@@ -14,7 +14,17 @@
 //	OMNIA_DIALHOME_PACK      the compiled .pack.json (or -pack)
 //	OMNIA_DIALHOME_PROMPT    the pack prompt to run (or -prompt)
 //	OMNIA_DIALHOME_CLIENT_TOOLS  comma-separated client tools (or -client-tools)
-//	PORT                     when set, serve /healthz and /readyz on it
+//	OMNIA_DIALHOME_PORT      when set, serve /healthz and /readyz on it
+//	PORT                     the same, when OMNIA_DIALHOME_PORT is unset
+//
+// When it is deployed by a PromptKit deploy adapter in place of the adapter's
+// own runtime, the adapter hands it the pack and the agent instead:
+//
+//	PROMPTPACK_PACK_JSON     the compiled pack, inline (when no pack is given)
+//	PROMPTPACK_AGENT         the pack prompt to run (when no prompt is given)
+//
+// A pack the adapter staged to storage (PROMPTPACK_PACK_URI) is refused: give
+// the pack another way.
 package main
 
 import (
@@ -27,6 +37,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -52,25 +63,43 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Getenv))
 }
 
+// The deploy handoff: what a PromptKit deploy adapter sets on any container it
+// deploys in place of its own runtime.
+const (
+	envHandoffPackJSON = "PROMPTPACK_PACK_JSON"
+	envHandoffPackURI  = "PROMPTPACK_PACK_URI"
+	envHandoffAgent    = "PROMPTPACK_AGENT"
+)
+
 // options are the command's settings.
 type options struct {
 	pack, prompt string
-	clientTools  []string
-	port         string
+	// packJSON is a pack handed over inline, written to a file before use.
+	packJSON    string
+	clientTools []string
+	port        string
 }
 
 func parse(args []string, getenv func(string) string) (options, error) {
 	fs := flag.NewFlagSet("omnia-dialhome", flag.ContinueOnError)
 	pack := fs.String("pack", getenv("OMNIA_DIALHOME_PACK"), "compiled PromptPack (.pack.json)")
-	prompt := fs.String("prompt", getenv("OMNIA_DIALHOME_PROMPT"), "pack prompt to run")
+	prompt := fs.String("prompt", firstSet(getenv, "OMNIA_DIALHOME_PROMPT", envHandoffAgent), "pack prompt to run")
 	tools := fs.String("client-tools", getenv("OMNIA_DIALHOME_CLIENT_TOOLS"), "comma-separated client tools")
 	if err := fs.Parse(args); err != nil {
 		return options{}, err
 	}
-	if *pack == "" || *prompt == "" {
+	o := options{pack: *pack, prompt: *prompt, port: firstSet(getenv, "OMNIA_DIALHOME_PORT", "PORT")}
+	if o.pack == "" {
+		if getenv(envHandoffPackJSON) == "" && getenv(envHandoffPackURI) != "" {
+			return options{}, fmt.Errorf("the deploy staged the pack at %s=%s, which is not supported: "+
+				"give the pack with -pack or OMNIA_DIALHOME_PACK (for example in an image built FROM this one)",
+				envHandoffPackURI, getenv(envHandoffPackURI))
+		}
+		o.packJSON = getenv(envHandoffPackJSON)
+	}
+	if (o.pack == "" && o.packJSON == "") || o.prompt == "" {
 		return options{}, errors.New("a pack and a prompt are required (-pack, -prompt)")
 	}
-	o := options{pack: *pack, prompt: *prompt, port: getenv("PORT")}
 	for _, t := range strings.Split(*tools, ",") {
 		if t = strings.TrimSpace(t); t != "" {
 			o.clientTools = append(o.clientTools, t)
@@ -85,6 +114,15 @@ func run(args []string, getenv func(string) string) int {
 	if err != nil {
 		log.Error(err, "usage")
 		return exitUsage
+	}
+	if opts.packJSON != "" {
+		path, cleanup, err := writePack(opts.packJSON)
+		if err != nil {
+			log.Error(err, "pack not written")
+			return exitConfig
+		}
+		defer cleanup()
+		opts.pack = path
 	}
 	cfg, ok, err := dialhome.ConfigFromEnv(getenv)
 	if err != nil || !ok {
@@ -130,6 +168,32 @@ func run(args []string, getenv func(string) string) int {
 		return exitServe
 	}
 	return exitOK
+}
+
+// firstSet returns the value of the first of names that is set.
+func firstSet(getenv func(string) string, names ...string) string {
+	for _, name := range names {
+		if v := getenv(name); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// writePack writes a pack handed over inline to a private file, since the
+// runtime opens packs by path. cleanup removes it.
+func writePack(packJSON string) (path string, cleanup func(), err error) {
+	dir, err := os.MkdirTemp("", "omnia-dialhome-")
+	if err != nil {
+		return "", nil, fmt.Errorf("pack directory: %w", err)
+	}
+	cleanup = func() { _ = os.RemoveAll(dir) }
+	path = filepath.Join(dir, "agent.pack.json")
+	if err := os.WriteFile(path, []byte(packJSON), 0o600); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("write pack: %w", err)
+	}
+	return path, cleanup, nil
 }
 
 // defaultProvider builds each conversation's provider from the agent's
