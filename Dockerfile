@@ -7,12 +7,13 @@
 #     -e OMNIA_DIALHOME_PACK=/pack/agent.pack.json -e OMNIA_DIALHOME_PROMPT=chat \
 #     -e OMNIA_DIAL_HOME_URL=wss://... -e OMNIA_DIAL_HOME_KEY=... omnia-dialhome
 
-FROM golang:1.26 AS build
+FROM --platform=$BUILDPLATFORM golang:1.26 AS build
+ARG TARGETOS TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/omnia-dialhome ./cmd/omnia-dialhome
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/omnia-dialhome ./cmd/omnia-dialhome
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/omnia-dialhome /omnia-dialhome
