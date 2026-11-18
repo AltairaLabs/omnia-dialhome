@@ -21,6 +21,8 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
 
+	"github.com/go-logr/logr"
+
 	"github.com/AltairaLabs/omnia-dialhome/runtimev1"
 )
 
@@ -52,6 +54,7 @@ const DefaultHeartbeat = 10 * time.Second
 type config struct {
 	maxMessageSize int
 	heartbeat      time.Duration
+	log            logr.Logger
 	opts           []grpc.ServerOption
 }
 
@@ -63,6 +66,10 @@ func WithMaxMessageSize(n int) Option { return func(c *config) { c.maxMessageSiz
 
 // WithHeartbeat overrides the heartbeat interval.
 func WithHeartbeat(d time.Duration) Option { return func(c *config) { c.heartbeat = d } }
+
+// WithLogger logs what the facade cannot see: a turn that failed is only an
+// INTERNAL_ERROR frame on the wire. The zero Logger discards.
+func WithLogger(l logr.Logger) Option { return func(c *config) { c.log = l } }
 
 // WithServerOptions appends gRPC server options (interceptors, a stats
 // handler).
@@ -82,7 +89,7 @@ func NewServer(h Handler, opts ...Option) *grpc.Server {
 		grpc.MaxSendMsgSize(cfg.maxMessageSize),
 	}, cfg.opts...)
 	srv := grpc.NewServer(so...)
-	runtimev1.RegisterRuntimeServiceServer(srv, &service{h: h, heartbeat: cfg.heartbeat})
+	runtimev1.RegisterRuntimeServiceServer(srv, &service{h: h, heartbeat: cfg.heartbeat, log: cfg.log})
 	hs := health.NewServer()
 	healthpb.RegisterHealthServer(srv, hs)
 	hs.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
@@ -103,6 +110,7 @@ type service struct {
 	runtimev1.UnimplementedRuntimeServiceServer
 	h         Handler
 	heartbeat time.Duration
+	log       logr.Logger
 }
 
 // Health advertises readiness, the contract version and the capabilities.
@@ -208,6 +216,7 @@ func (c *conversation) handle(msg *runtimev1.ClientMessage) error {
 		Metadata: msg.GetMetadata(), Identity: c.id, ClientToolsAvailable: c.clientTools,
 	}
 	if err := c.s.turn(c.ctx, c.stream, c.out, turn); err != nil {
+		c.s.log.Info("turn failed", "sessionID", turn.SessionID, "err", err.Error())
 		_ = c.out.send(errorFrame(CodeInternal, "an internal error occurred while processing the message"))
 	}
 	return nil
@@ -217,7 +226,7 @@ func (c *conversation) handle(msg *runtimev1.ClientMessage) error {
 func (s *service) turn(ctx context.Context, stream runtimev1.RuntimeService_ConverseServer, out *sender, t Turn) error {
 	stop := out.heartbeat(s.heartbeat)
 	defer stop()
-	emit := &emitter{out: out, stream: stream}
+	emit := &emitter{out: out, stream: stream, stopBeat: stop}
 	if err := s.h.Converse(ctx, t, emit); err != nil {
 		return err
 	}
@@ -289,13 +298,17 @@ func (s *sender) heartbeat(d time.Duration) (stop func()) {
 			}
 		}
 	}()
-	return func() { close(done); wg.Wait() }
+	var once sync.Once
+	return func() { once.Do(func() { close(done); wg.Wait() }) }
 }
 
 // emitter is one turn's Emitter.
 type emitter struct {
 	out    *sender
 	stream runtimev1.RuntimeService_ConverseServer
+
+	// stopBeat stops the turn's heartbeat, so none follows its Done.
+	stopBeat func()
 
 	mu   sync.Mutex
 	done bool
@@ -322,6 +335,9 @@ func (e *emitter) Done(d Done) error {
 	e.mu.Lock()
 	e.done = true
 	e.mu.Unlock()
+	if e.stopBeat != nil {
+		e.stopBeat()
+	}
 	var usage *runtimev1.Usage
 	if d.Usage != nil {
 		usage = &runtimev1.Usage{InputTokens: d.Usage.InputTokens, OutputTokens: d.Usage.OutputTokens, CostUsd: d.Usage.CostUSD}
@@ -351,6 +367,10 @@ func (e *emitter) ToolCall(call ClientToolCall) (ClientToolResult, error) {
 	res := msg.GetClientToolResult()
 	if res == nil {
 		return ClientToolResult{}, status.Error(codes.FailedPrecondition, "expected ClientToolResult after ToolCall")
+	}
+	if res.GetCallId() != call.ID {
+		return ClientToolResult{}, status.Errorf(codes.FailedPrecondition,
+			"ClientToolResult answers %q, not the call %q", res.GetCallId(), call.ID)
 	}
 	return ClientToolResult{
 		CallID: res.GetCallId(), ResultJSON: res.GetResultJson(), IsRejected: res.GetIsRejected(),

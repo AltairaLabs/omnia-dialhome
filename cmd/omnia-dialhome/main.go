@@ -125,7 +125,7 @@ func run(args []string, getenv func(string) string) int {
 		_ = ch.Close()
 	}()
 	log.Info("serving over dial-home", "pack", opts.pack, "prompt", opts.prompt)
-	if err := server.Serve(ch, h); err != nil {
+	if err := server.Serve(ch, h, server.WithLogger(log)); err != nil {
 		log.Error(err, "serve failed")
 		return exitServe
 	}

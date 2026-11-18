@@ -12,7 +12,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AltairaLabs/PromptKit/runtime/v2/providers"
@@ -76,11 +79,53 @@ var (
 type session struct {
 	conv     *sdk.Conversation
 	provider providers.Provider
+	lastUsed time.Time // guarded by Handler.mu
 
-	mu       sync.Mutex // one turn at a time
-	emit     server.Emitter
-	clients  bool // the current turn has a client to answer tool calls
-	lastUsed time.Time
+	// turn holds one turn at a time; a turn waiting for it gives up when its
+	// own stream ends.
+	turn chan struct{}
+	// ended is set once the conversation is closed.
+	ended atomic.Bool
+
+	mu      sync.Mutex
+	emit    server.Emitter
+	clients bool // the current turn has a client to answer tool calls
+}
+
+func newSession(now time.Time) *session {
+	return &session{lastUsed: now, turn: make(chan struct{}, 1)}
+}
+
+func (s *session) acquire(ctx context.Context) error {
+	select {
+	case s.turn <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *session) tryAcquire() bool {
+	select {
+	case s.turn <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *session) release() { <-s.turn }
+
+func (s *session) setTurn(emit server.Emitter, clients bool) {
+	s.mu.Lock()
+	s.emit, s.clients = emit, clients
+	s.mu.Unlock()
+}
+
+func (s *session) current() (server.Emitter, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.emit, s.clients
 }
 
 // New returns a Handler for cfg. The pack is opened per conversation, so a
@@ -115,69 +160,161 @@ func (h *Handler) HasConversation(_ context.Context, sessionID string) server.Re
 	return server.ResumeNotFound
 }
 
-// EndConversation closes the session's conversation.
-func (h *Handler) EndConversation(_ context.Context, sessionID string) {
+// EndConversation closes the session's conversation once any turn on it has
+// finished.
+func (h *Handler) EndConversation(ctx context.Context, sessionID string) {
 	h.mu.Lock()
 	s := h.convs[sessionID]
 	delete(h.convs, sessionID)
 	h.mu.Unlock()
 	if s != nil {
-		h.close(sessionID, s)
+		h.end(ctx, sessionID, s)
 	}
 }
 
-// Close closes every conversation.
+// closeWait bounds how long Close waits for a turn in progress.
+const closeWait = 5 * time.Second
+
+// Close closes every conversation, waiting up to five seconds for each turn
+// in progress.
 func (h *Handler) Close() error {
 	h.mu.Lock()
 	convs := h.convs
 	h.convs = map[string]*session{}
 	h.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), closeWait)
+	defer cancel()
 	for id, s := range convs {
-		h.close(id, s)
+		h.end(ctx, id, s)
 	}
 	return nil
 }
 
+// end closes s once it holds no turn (or ctx ends), and marks it ended so a
+// turn that was waiting for it does not run on a closed conversation.
+func (h *Handler) end(ctx context.Context, id string, s *session) {
+	if s.acquire(ctx) == nil {
+		defer s.release()
+	}
+	s.ended.Store(true)
+	h.close(id, s)
+}
+
+// errEnded is a turn on a conversation that ended while it waited.
+var errEnded = errors.New("promptkit: the conversation has ended")
+
 // Converse runs one turn on the session's conversation, streaming the reply.
 func (h *Handler) Converse(ctx context.Context, t server.Turn, emit server.Emitter) error {
-	s, err := h.session(ctx, t.SessionID)
-	if err != nil {
-		return err
+	if t.SessionID == "" {
+		return errors.New("promptkit: a turn needs a session id")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.emit, s.clients = emit, t.ClientToolsAvailable
-	defer func() { s.emit, s.clients = nil, false }()
-
 	msg, err := userMessage(t)
 	if err != nil {
 		return err
 	}
 	var opts []sdk.SendOption
-	if len(t.Metadata) > 0 {
-		md := make(map[string]any, len(t.Metadata))
-		for k, v := range t.Metadata {
-			md[k] = v
-		}
+	md, err := forwardedMetadata(t.Metadata)
+	if err != nil {
+		return err
+	}
+	if md != nil {
 		opts = append(opts, sdk.WithMessageMetadata(md))
 	}
-	for chunk := range s.conv.Stream(ctx, msg, opts...) {
-		if chunk.Error != nil {
-			return chunk.Error
+	s, err := h.session(ctx, t.SessionID)
+	if err != nil {
+		return err
+	}
+	if err := s.acquire(ctx); err != nil {
+		return err
+	}
+	defer s.release()
+	if s.ended.Load() {
+		return errEnded
+	}
+	s.setTurn(emit, t.ClientToolsAvailable)
+	defer s.setTurn(nil, false)
+	return stream(ctx, s.conv, msg, opts, emit)
+}
+
+// stream runs the turn and relays it. It always drains the SDK's stream, so
+// the conversation is free for the next turn, and nothing of this turn
+// outlives it.
+func stream(ctx context.Context, conv *sdk.Conversation, msg any, opts []sdk.SendOption, emit server.Emitter) error {
+	turnCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var result error
+	finished := false
+	for chunk := range conv.Stream(turnCtx, msg, opts...) {
+		if finished {
+			continue
 		}
-		switch chunk.Type {
-		case sdk.ChunkText:
+		switch {
+		case chunk.Error != nil:
+			result, finished = chunk.Error, true
+		case chunk.Type == sdk.ChunkText:
 			if err := emit.Chunk(chunk.Text); err != nil {
-				return err
+				result, finished = err, true
 			}
-		case sdk.ChunkDone:
-			return emit.Done(done(chunk.Message))
+		case chunk.Type == sdk.ChunkDone:
+			result, finished = emit.Done(done(chunk.Message)), true
 		default:
 			// Server-side tool calls run inside PromptKit and are not part of
 			// the protocol; client tools are answered by clientTool.
 		}
+		if finished {
+			cancel()
+		}
 	}
-	return ctx.Err()
+	if !finished {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return errors.New("promptkit: the turn ended without a reply")
+	}
+	return result
+}
+
+// Limits on the metadata a turn forwards to the model, and the keys that are
+// the platform's: as Omnia's own runtime applies them.
+const (
+	maxMetadataKeys        = 32
+	maxMetadataKeyLen      = 64
+	maxMetadataValueBytes  = 8 << 10
+	maxMetadataTotalBytes  = 32 << 10
+	reservedMetadataPrefix = "omnia."
+)
+
+var (
+	reservedMetadataKeys = map[string]bool{"mock_scenario": true, "content_type": true}
+	metadataKeyPattern   = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+	errMessageMetadata   = errors.New("invalid message metadata")
+)
+
+// forwardedMetadata is the part of a turn's metadata the model may see, or
+// nil: never a reserved key, and an error when the rest breaks a limit.
+func forwardedMetadata(in map[string]string) (map[string]any, error) {
+	var out map[string]any
+	total := 0
+	for k, v := range in {
+		if reservedMetadataKeys[k] || strings.HasPrefix(k, reservedMetadataPrefix) {
+			continue
+		}
+		if len(k) > maxMetadataKeyLen || !metadataKeyPattern.MatchString(k) {
+			return nil, fmt.Errorf("%w: a key is longer than %d bytes or not [A-Za-z0-9_.-]", errMessageMetadata, maxMetadataKeyLen)
+		}
+		if len(v) > maxMetadataValueBytes {
+			return nil, fmt.Errorf("%w: %s is longer than %d bytes", errMessageMetadata, k, maxMetadataValueBytes)
+		}
+		total += len(k) + len(v)
+		if out == nil {
+			out = map[string]any{}
+		}
+		out[k] = v
+	}
+	if len(out) > maxMetadataKeys || total > maxMetadataTotalBytes {
+		return nil, fmt.Errorf("%w: at most %d keys and %d bytes", errMessageMetadata, maxMetadataKeys, maxMetadataTotalBytes)
+	}
+	return out, nil
 }
 
 func done(r *sdk.Response) server.Done {
@@ -253,10 +390,11 @@ func (h *Handler) session(ctx context.Context, id string) (*session, error) {
 func (h *Handler) takeIdle() map[string]*session {
 	var idle map[string]*session
 	for id, s := range h.convs {
-		if h.now().Sub(s.lastUsed) < h.cfg.IdleTTL || !s.mu.TryLock() {
+		if h.now().Sub(s.lastUsed) < h.cfg.IdleTTL || !s.tryAcquire() {
 			continue
 		}
-		s.mu.Unlock()
+		s.ended.Store(true)
+		s.release()
 		if idle == nil {
 			idle = map[string]*session{}
 		}
@@ -267,10 +405,12 @@ func (h *Handler) takeIdle() map[string]*session {
 }
 
 func (h *Handler) open(ctx context.Context, id string) (*session, error) {
-	s := &session{lastUsed: h.now()}
+	s := newSession(h.now())
 	opts := append([]sdk.Option{sdk.WithConversationID(id)}, h.cfg.Options...)
 	if h.cfg.Provider != nil {
-		p, err := h.cfg.Provider(ctx)
+		// Not the stream's ctx: the provider lives with the conversation, and
+		// a credential source may keep its ctx to refresh tokens with.
+		p, err := h.cfg.Provider(context.WithoutCancel(ctx))
 		if err != nil {
 			return nil, fmt.Errorf("promptkit: provider: %w", err)
 		}
@@ -321,7 +461,7 @@ var errNoClient = errors.New("no client is connected to run this tool")
 // its answer to the model. It runs inside the conversation's turn, so the
 // turn's emitter is set.
 func (s *session) clientTool(_ context.Context, req sdk.ClientToolRequest) (any, error) {
-	emit, clients := s.emit, s.clients
+	emit, clients := s.current()
 	if emit == nil || !clients {
 		return nil, errNoClient
 	}
