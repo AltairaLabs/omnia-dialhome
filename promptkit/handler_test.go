@@ -168,6 +168,50 @@ func TestConversationsArePerSessionAndEnd(t *testing.T) {
 	assert.Error(t, err, "a part the pack cannot take is refused")
 }
 
+func TestTurnsTheHandlerRefuses(t *testing.T) {
+	h := newHandler(t, promptkit.Config{Provider: provider(false)})
+	ctx := context.Background()
+	assert.Error(t, h.Converse(ctx, server.Turn{Content: "hi"}, &collect{}), "no session id")
+	assert.Error(t, h.Converse(ctx, server.Turn{SessionID: "s", Content: "hi",
+		Metadata: map[string]string{"bad key": "x"}}, &collect{}))
+	assert.Error(t, h.Converse(ctx, server.Turn{SessionID: "s", Content: "hi",
+		Metadata: map[string]string{"k": strings.Repeat("x", 9<<10)}}, &collect{}))
+
+	emit := &collect{}
+	require.NoError(t, h.Converse(ctx, server.Turn{SessionID: "s", Content: "hi",
+		Metadata: map[string]string{"omnia.route": "x", "mock_scenario": "y", "ticket": "T-1"}}, emit),
+		"reserved keys are dropped, not refused")
+	assert.Equal(t, reply, emit.done.Final)
+}
+
+func TestATurnWaitingOnABusySessionGivesUpWithItsStream(t *testing.T) {
+	h := newHandler(t, promptkit.Config{Provider: provider(true), ClientTools: []string{"get_location"}})
+	block := &blocking{asked: make(chan struct{}), answer: make(chan struct{})}
+	go func() {
+		_ = h.Converse(context.Background(), server.Turn{SessionID: "busy", Content: "where",
+			ClientToolsAvailable: true}, block)
+	}()
+	<-block.asked
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err := h.Converse(ctx, server.Turn{SessionID: "busy", Content: "again"}, &collect{})
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	close(block.answer)
+}
+
+// blocking is an Emitter whose client takes until answer closes.
+type blocking struct {
+	collect
+	asked, answer chan struct{}
+}
+
+func (b *blocking) ToolCall(c server.ClientToolCall) (server.ClientToolResult, error) {
+	close(b.asked)
+	<-b.answer
+	return server.ClientToolResult{CallID: c.ID, ResultJSON: `{}`}, nil
+}
+
 func TestNew_RequiresAPackAndPrompt(t *testing.T) {
 	_, err := promptkit.New(promptkit.Config{PackPath: testPack})
 	assert.Error(t, err)

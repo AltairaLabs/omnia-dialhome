@@ -170,6 +170,19 @@ func TestConverse_ClientToolRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, `c1={"lat":1}`, m.GetDone().GetFinalContent())
 
+	// A result for another call is refused.
+	s, err = c.Converse(ctx)
+	require.NoError(t, err)
+	require.NoError(t, s.Send(&runtimev1.ClientMessage{SessionId: "s", Content: "where am I"}))
+	_, _ = s.Recv() // hello
+	_, err = s.Recv()
+	require.NoError(t, err)
+	require.NoError(t, s.Send(&runtimev1.ClientMessage{SessionId: "s",
+		ClientToolResult: &runtimev1.ClientToolResult{CallId: "other"}}))
+	m, err = s.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, CodeInternal, m.GetError().GetCode())
+
 	// Without the header there is no client to ask.
 	s, err = c.Converse(ctxT(t))
 	require.NoError(t, err)
