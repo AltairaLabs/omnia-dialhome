@@ -1,0 +1,1172 @@
+// Copyright 2024 Altaira Labs
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package omnia.runtime.v1;
+
+option go_package = "github.com/AltairaLabs/omnia-dialhome/runtimev1;runtimev1";
+
+// Contract-Version: 1.15.0
+//
+// The version of this contract, as consumed by third-party runtime
+// implementations. Bump the minor version for additive changes (new message,
+// new optional field, new oneof variant); bump the major version for any
+// change that would break an existing conformant runtime. The value is
+// mirrored in runtimev1.ContractVersion; a test asserts the two agree.
+//
+// This is the contract Omnia's facade speaks to an agent's runtime, published
+// here so a runtime hosted outside the cluster can serve it over the
+// dial-home channel. Report the Contract-Version you built against from
+// Health via contract_version.
+
+// RuntimeService defines the communication protocol between the facade and runtime containers.
+// The facade handles external protocol translation (WebSocket/REST/gRPC to internal gRPC),
+// while the runtime handles all business logic including sessions, LLM calls, and tool execution.
+//
+// Caller identity and JWT claims are NOT message fields — they travel as flat
+// x-omnia-* gRPC metadata attached by the facade (the raw Authorization bearer
+// token is deliberately withheld). The server package names the keys.
+service RuntimeService {
+  // Converse handles bidirectional streaming for agent conversations.
+  // The client sends messages and receives a stream of responses including
+  // text chunks, tool calls, tool results, and completion signals.
+  rpc Converse(stream ClientMessage) returns (stream ServerMessage);
+
+  // Invoke runs a one-shot, non-conversational Function call. The facade
+  // forwards a payload-in / payload-out request from POST /functions/{name}
+  // and waits for the full response. Used for function-mode AgentRuntimes
+  // (spec.mode == "function").
+  //
+  // The runtime is schema-agnostic — the facade validates input_json against
+  // AgentRuntime.spec.inputSchema before calling, and validates output_json
+  // against spec.outputSchema after returning. The runtime just executes
+  // the pack once.
+  rpc Invoke(InvocationRequest) returns (InvocationResponse);
+
+  // Health checks the runtime's readiness to handle requests.
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  // HasConversation reports whether a session's working context can still be
+  // resumed. The runtime owns the context store, so it is the only component
+  // that can answer this — a session-api row proves only that the conversation
+  // once existed, not that its turns are still in the statestore.
+  //
+  // The answer is exact rather than approximate: sdk.Resume succeeds precisely
+  // when the state store returns a non-nil state for the id, so this RPC
+  // performs the same load against the same store.
+  rpc HasConversation(HasConversationRequest) returns (HasConversationResponse);
+
+  // EndConversation tells the runtime a conversation has ended: the client
+  // connection that carried it closed, and its last turn has finished. It is
+  // the only end-of-conversation signal on the wire — Converse streams are
+  // opened per MESSAGE, so a stream ending says nothing about the
+  // conversation — and the runtime uses it to schedule the release of the
+  // conversation's sandboxes after spec.sandbox.releaseGrace.
+  //
+  // Best-effort and idempotent: a facade that never sends it (REST, A2A — no
+  // connection outlives a request) leaves the sandboxes to their idle
+  // timeout, and a runtime that does not implement it answers Unimplemented,
+  // which the facade ignores. A message arriving for the session afterwards
+  // withdraws the release.
+  rpc EndConversation(EndConversationRequest) returns (EndConversationResponse);
+
+  // EraseConversation erases a session's conversation for a data-subject
+  // erasure (contract 1.15.0): the runtime drops the conversation it
+  // holds in memory WITHOUT completing it (no conversation-level evals run
+  // over data being erased), and deletes everything it keeps for the session in its
+  // own stores — the context store's conversation, a CLI runtime's saved
+  // transcript, and any held round and its records. A session that has a turn
+  // in progress on this runtime answers FailedPrecondition and erases nothing,
+  // so the caller can retry once the turn has finished.
+  //
+  // Idempotent: erasing a session the runtime holds nothing for succeeds. Not
+  // best-effort, unlike EndConversation: the facade reports any error,
+  // Unimplemented included, to the erasure that asked, which records it on the
+  // request rather than reporting the session erased.
+  rpc EraseConversation(EraseConversationRequest) returns (EraseConversationResponse);
+
+  // WatchInvocation streams the progress of one Invoke call (contract 1.8.0).
+  //
+  // It is an OBSERVATION channel beside Invoke, never a second way to run a
+  // function: the call itself, its output and its errors still travel on the
+  // unary Invoke, so recording, rate limiting and output validation are the
+  // same whether anyone watches or not. The facade opens a watch for an
+  // invocation id it minted, waits for the `ready` message, then calls Invoke
+  // with that id; the runtime forwards the invocation's tool calls and tool
+  // results as they happen, and ends the stream
+  // (status OK) once the invocation has finished and every event it produced
+  // has been sent. Used by POST /functions/{name} with
+  // `Accept: text/event-stream`.
+  //
+  // Best-effort: events may be dropped under backpressure, and a runtime that
+  // does not implement it answers Unimplemented, which the facade treats as
+  // "no progress to report" rather than as a failure.
+  rpc WatchInvocation(WatchInvocationRequest) returns (stream InvocationProgress);
+
+  // ReadTurns reads a session's conversation after a given message (contract
+  // 1.12.0): the reconnect read. A client that was away while its turn
+  // finished — a held call answered, then the socket gone before the reply —
+  // reconnects and asks for what came after the last message it saw. Delivery
+  // does not depend on session-api: the answer comes from the runtime's own
+  // conversation state.
+  //
+  // It is a pure read: it does not extend the conversation's context TTL. A
+  // runtime with no state store answers FAILED_PRECONDITION, a session it
+  // holds no state for NOT_FOUND, and a runtime built against an older
+  // contract Unimplemented.
+  rpc ReadTurns(ReadTurnsRequest) returns (ReadTurnsResponse);
+
+  // CheckReferralOverride asks whether an approver's argument override of a
+  // referred call would be allowed (contract 1.13.0). referral-api
+  // carries the check to the agent's facade, which asks its runtime here. The
+  // runtime rebuilds the call's context from its held-call record and asks the
+  // policy broker with approval.check=override and the approved statement
+  // keys, against the NEW arguments. Nothing runs and nothing is staged: it is
+  // a decision only. A call that is not a held referral of the session is
+  // NOT_FOUND; a broker error or timeout is a refusal (fail closed), never an
+  // allow.
+  rpc CheckReferralOverride(ReferralOverrideCheckRequest) returns (ReferralOverrideCheckResponse);
+}
+
+// ClientMessage represents a message from the client to the runtime.
+message ClientMessage {
+  // session_id identifies the conversation session for state management.
+  string session_id = 1;
+
+  // content is the user's message text (legacy, for backward compatibility).
+  // For multimodal messages, use the parts field instead.
+  string content = 2;
+
+  // metadata contains optional key-value pairs for additional context. When
+  // the agent's default Provider sets messageMetadataTemplate, the runtime
+  // forwards the non-reserved keys to the model through that template.
+  map<string, string> metadata = 3;
+
+  // parts contains multimodal content parts (text, images, audio, video, files).
+  // If non-empty, this takes precedence over the content field.
+  repeated ContentPart parts = 4;
+
+  // client_tool_result carries the result of a client-side tool execution.
+  // Set when responding to a ToolCall with execution=CLIENT.
+  ClientToolResult client_tool_result = 5;
+
+  // Field 6 was consent_grants: per-message consent category grants asserted
+  // by the client. Removed — nothing ever set it, the facade used a
+  // metadata header instead, and a third-party runtime built to this contract
+  // read an always-empty list and concluded the subject had consented to
+  // nothing. Consent is now a live lookup against privacy-api, keyed on the
+  // verified subject; a runtime never sees grants on the wire.
+  reserved 6;
+  reserved "consent_grants";
+
+  // duplex_start, when set on the first message of a Converse stream, switches
+  // the stream into bidirectional audio mode (OSS duplex transport).
+  DuplexStart duplex_start = 7;
+
+  // audio_input carries one inbound audio frame during a duplex session.
+  AudioInputChunk audio_input = 8;
+
+  // record_sequence_base is the position the runtime should number its recorded
+  // records from, so the facade's messages and the runtime's tool calls share
+  // one ordering space for the session.
+  //
+  // Neither side can derive this alone. The runtime knows the exact order of
+  // everything it does, but not where the conversation had reached; the facade
+  // knows the conversation but never sees a server-side tool call, so it cannot
+  // tell that message 2 is really position 51 because fifty tool calls happened
+  // in between. So the facade sends where it is, and the runtime numbers from
+  // there — see Done.record_sequence_high_water for the other half.
+  //
+  // Zero on the first message of a session, and from a caller that does not
+  // track ordering. A runtime that supplies no sequence ignores it.
+  int64 record_sequence_base = 9;
+
+  // held_call_outcomes answers tool calls a previous turn of this session left
+  // HELD (see TurnHeld), on a new Converse stream (contract 1.12.0).
+  // Sent as the stream's only message, with session_id and nothing else: it is
+  // not a user turn and carries no content.
+  //
+  // The runtime checks every outcome against its own record of the session's
+  // held calls and refuses the whole message, with an Error whose code is
+  // HELD_CALL_UNKNOWN, when any call id is not held for THIS session or
+  // already has an outcome — so a result can never reach another session's
+  // turn, whatever call id it names. Otherwise it stages the outcomes. When
+  // every held call of the round has one, it resumes the turn and streams it
+  // as usual (chunks, tool calls, Done, or another TurnHeld); while some are
+  // still outstanding it answers with a TurnHeld naming them and ends.
+  HeldCallOutcomes held_call_outcomes = 10;
+
+  // annotation is an opaque value the facade attaches to this turn's user
+  // message (contract 1.14.0). The runtime stores it beside that message in
+  // the conversation's context store and returns it on the message's
+  // TurnMessage.annotation from ReadTurns, so a facade can keep what it needs
+  // of a turn without a store of its own.
+  //
+  // The runtime never interprets it. It is not sent to the model, not
+  // rendered by a Provider's messageMetadataTemplate, and not recorded to
+  // session-api; it lives and expires with the message it is stored beside.
+  // At most 64 KiB: a turn with a larger annotation fails with an Error whose
+  // code is INVALID_MESSAGE, and is never truncated. It is read on a text
+  // turn's user message only; a message that is not a user turn (a client tool
+  // result, held call outcomes, audio) and a duplex session ignore it. A
+  // runtime built before contract 1.14.0 ignores it too, so a facade that
+  // relies on it checks the runtime's contract version first.
+  bytes annotation = 11;
+}
+
+// HeldCallOutcomes carries outcomes for a session's held tool calls. See
+// ClientMessage.held_call_outcomes.
+message HeldCallOutcomes {
+  // client_results are the client's answers to held CLIENT tool calls, with
+  // the same meaning as on ClientMessage.client_tool_result: a result, the
+  // client's tool failing (is_rejected), or a refusal (is_rejected and
+  // is_denied).
+  repeated ClientToolResult client_results = 1;
+
+  // referral_decisions are referral-api's decisions on calls the runtime held
+  // for approval (contract 1.13.0), delivered by the facade
+  // from referral-api's decision feed, never from a client. Each answers one
+  // held REFERRAL call; client_results never answer one, and a decision never
+  // answers a client call. A decision carries no user: the approver is not the user, and an
+  // approved call runs as the user it was held for, restored from the
+  // runtime's own record.
+  repeated ReferralDecision referral_decisions = 2;
+
+  // round_id, when set, is the held round the outcomes answer
+  // (TurnHeld.round_id, contract 1.13.0). The runtime stages them only
+  // while that round is still the session's held one, checked atomically with
+  // the stage, so an answer granted for one round can never land in a later
+  // round that reuses its call ids. Empty: any round of the session.
+  string round_id = 3;
+}
+
+// ReferralDecision is the verdict on a held referral call.
+message ReferralDecision {
+  // call_id is the held tool call's id.
+  string call_id = 1;
+
+  // referral_ids are the referrals the verdict settles. The runtime checks
+  // them against its own record of the call and refuses a decision naming
+  // any it did not raise.
+  repeated string referral_ids = 2;
+
+  // approved is true when every role approved: the runtime runs the call,
+  // re-checking it against the policy in force now. False is a rejection,
+  // expiry included.
+  bool approved = 3;
+
+  // reason is why it was rejected, as the approver (or the expiry) said.
+  string reason = 4;
+
+  // arguments_json is an approved argument override, checked when it was
+  // approved and re-checked when the call runs. Empty runs the call with its
+  // own arguments.
+  string arguments_json = 5;
+
+  // referrals are referral-api's record of each referral the verdict
+  // settles (contract 1.13.0): its role, the state the decision left
+  // it in, and who decided it. The runtime decides nothing on them; it
+  // records them in the oversight_intervention audit event, one per
+  // referral. Empty from a referral-api that predates them.
+  repeated ReferralVerdict referrals = 6;
+
+  // raised_at_unix_ms and expires_at_unix_ms are when referral-api raised
+  // the held call and when its referrals lapse. Zero when not sent.
+  int64 raised_at_unix_ms = 7;
+  int64 expires_at_unix_ms = 8;
+}
+
+// ReferralVerdict is one referral's share of a ReferralDecision, as
+// referral-api recorded it. It names the approver, never the user:
+// the user an approved call runs as comes from the runtime's own record.
+message ReferralVerdict {
+  // referral_id is one of ReferralDecision.referral_ids.
+  string referral_id = 1;
+
+  // role is the approver role the referral asked.
+  string role = 2;
+
+  // state is what the decision left the referral: approved, rejected,
+  // expired or superseded.
+  string state = 3;
+
+  // decider_kind and decider_subject are the principal referral-api
+  // authenticated when the referral was decided (decisionToken, oidc or
+  // serviceAccount, and its subject). Empty for a referral nobody decided.
+  string decider_kind = 4;
+  string decider_subject = 5;
+
+  // asserted_decided_by is who the approver's caller SAID decided, recorded
+  // as asserted and never verified.
+  repeated string asserted_decided_by = 6;
+
+  // decided_at_unix_ms is when the referral left pending. Zero when not sent.
+  int64 decided_at_unix_ms = 7;
+}
+
+// ReferralOverrideCheckRequest names a held referral call and the arguments an
+// approver would run it with.
+message ReferralOverrideCheckRequest {
+  // session_id is the conversation holding the call.
+  string session_id = 1;
+
+  // call_id is the held tool call's id.
+  string call_id = 2;
+
+  // referral_ids are the referrals being decided; checked against the record.
+  repeated string referral_ids = 3;
+
+  // arguments_json is the override.
+  string arguments_json = 4;
+}
+
+// ReferralOverrideCheckResponse is the broker's verdict on an override.
+message ReferralOverrideCheckResponse {
+  // allowed is true when the call may run with the overridden arguments.
+  bool allowed = 1;
+
+  // denied_by names the refusing statement when it may not.
+  string denied_by = 2;
+
+  // message says why, naming the refusing statement.
+  string message = 3;
+
+  // policy_changed is set when a policy the approval named has changed since
+  // the hold.
+  bool policy_changed = 4;
+
+  // digests_at_check are the current digests of the policies the approval
+  // named, keyed by "namespace/name".
+  map<string, string> digests_at_check = 5;
+}
+
+// ClientToolResult carries the client's response to a client-side tool call.
+message ClientToolResult {
+  // call_id matches the ToolCall.id that this result is for.
+  string call_id = 1;
+
+  // result_json contains the tool result as a JSON string.
+  string result_json = 2;
+
+  // is_rejected indicates the client rejected the tool call.
+  bool is_rejected = 3;
+
+  // rejection_reason explains why the client rejected the tool call.
+  string rejection_reason = 4;
+
+  // is_denied marks a rejection as a refusal rather than a failure: the client
+  // declined the call (tool_call_nack), or never answered it (no
+  // acknowledgement, the client tool timeout, or the client gone). The runtime
+  // records the call as denied. Without it, a rejection is the client's tool
+  // failing, and is recorded as an error. Only meaningful with is_rejected.
+  bool is_denied = 5;
+}
+
+// ServerMessage represents a message from the runtime to the client.
+// Uses oneof to ensure only one message type is sent at a time.
+message ServerMessage {
+  oneof message {
+    // chunk contains a partial text response for streaming.
+    Chunk chunk = 1;
+
+    // tool_call notifies the facade of a client-side tool invocation.
+    // The facade forwards this to the WebSocket client, which must respond
+    // with a ClientToolResult before the conversation can continue.
+    // Server-side tool calls are handled internally by the runtime and
+    // are not sent on this stream.
+    ToolCall tool_call = 2;
+
+    // Field 3 was tool_result (removed — server-side tool results are
+    // handled internally by the runtime, not sent to the facade).
+
+    // done signals the completion of a response.
+    Done done = 4;
+
+    // error indicates an error occurred during processing.
+    Error error = 5;
+
+    // media_chunk contains a streaming media chunk (image, audio, video).
+    // Sent during streaming when the LLM produces media content, allowing
+    // the client to begin processing before the entire media is available.
+    MediaChunk media_chunk = 6;
+
+    // interruption signals a barge-in; the client clears buffered audio.
+    Interruption interruption = 7;
+
+    // runtime_hello is the runtime's first ServerMessage on a Converse stream:
+    // the session's authoritative capability set plus, for a duplex session, a
+    // bounded media counter-offer (codec/sample_rate/channels) the facade
+    // relays to the client. A runtime that never sends a hello is legacy — the
+    // facade proceeds with today's unilateral DuplexStart behaviour.
+    RuntimeHello runtime_hello = 8;
+
+    // heartbeat says the runtime is still working on this turn. It carries
+    // nothing and is never forwarded to the client. The runtime sends it
+    // periodically for as long as a text turn is in progress, so a turn that
+    // is silent on the stream while it legitimately works — a server-side tool
+    // call such as a sandbox cold start, which the facade never sees — is not
+    // mistaken for a stalled runtime by the facade's inactivity timeout. A
+    // facade that predates it ignores it as an unknown message, and any frame
+    // resets that timeout.
+    Heartbeat heartbeat = 9;
+
+    // voice_disclosure reports the audible EU AI Act Art. 50 disclosure at the
+    // start of a duplex session whose pack requires one. Sent once, after the
+    // disclosure audio (media_chunk) and before any agent output, so the facade
+    // records what actually happened on the voice surface. Absent when the pack
+    // requires no disclosure. Never forwarded to the client.
+    VoiceDisclosure voice_disclosure = 10;
+
+    // tool_activity reports what a SERVER-side tool call is doing when that
+    // matters to the person waiting on the turn: its connection is being
+    // retried, or it failed. Server-side calls are otherwise invisible
+    // to the facade (see tool_call). It carries the call's id, the tool's
+    // name and a short reason chosen by the runtime from a fixed vocabulary;
+    // never the call's arguments or result, and never the backend's error
+    // text. Sent while the turn runs, never after its Done. A facade that
+    // predates it ignores it as an unknown message.
+    ToolActivity tool_activity = 11;
+
+    // turn_held ends a turn whose tool calls cannot be answered within it
+    // (contract 1.12.0). It is sent in place of Done: the turn stopped
+    // with calls outstanding, and its record lives on in the runtime's
+    // conversation state, so the calls can be answered later on another
+    // stream — after a disconnect, on another facade replica, or after a
+    // restart — with ClientMessage.held_call_outcomes.
+    //
+    // Only a runtime with a durable conversation state store holds calls
+    // (spec.context.type: redis). Without one, client tool calls keep the
+    // in-stream exchange: ToolCall with execution=CLIENT, answered on the same
+    // stream with client_tool_result.
+    TurnHeld turn_held = 12;
+
+    // conversation_held refuses a new user turn because the session has held
+    // tool calls outstanding (contract 1.13.0). It is the turn's only
+    // frame after the hello: nothing reached the model, and the user's message
+    // is not part of the conversation. The runtime decides it from the
+    // held-call record in its conversation state, so the answer is the same on
+    // every replica and after a restart.
+    //
+    // Sent only on a stream carrying x-omnia-held-conversations: 1. A facade
+    // that does not send that header gets Error{code: TURN_IN_PROGRESS}, as
+    // under contract 1.12.0. A round being resumed (its outcomes are all in)
+    // is a turn in progress, not a held conversation, and is refused with
+    // TURN_IN_PROGRESS either way.
+    ConversationHeld conversation_held = 13;
+  }
+}
+
+// ConversationHeld is a user turn refused because the session's conversation
+// is held. See ServerMessage.conversation_held.
+message ConversationHeld {
+  // reply is the text to give the sender: the @heldReply of the ToolPolicy
+  // statement that referred the round's first held call that has one, else
+  // the AgentRuntime's spec.heldReply, else a built-in text. Never empty.
+  string reply = 1;
+
+  // outstanding_call_ids are the held round's calls still awaiting an outcome,
+  // client calls and calls the runtime holds itself alike.
+  repeated string outstanding_call_ids = 2;
+
+  // referral_ids name the referrals raised for the round's referred calls, in
+  // call-id order. Empty when no call of the round was referred.
+  repeated string referral_ids = 3;
+
+  // client_calls are the round's client calls still awaiting an answer, each a
+  // ToolCall with execution=CLIENT, so the facade can hand them back to a
+  // client allowed to answer them. The facade decides which client that is.
+  repeated ToolCall client_calls = 4;
+
+  // last_message_id is the conversation's last message: the round the calls
+  // were held in (TurnHeld.last_message_id), as ReadTurns reports it.
+  string last_message_id = 5;
+
+  // agent_reply is the reply without the referring statement's own: the
+  // AgentRuntime's spec.heldReply, else the built-in text. Never empty. A
+  // statement's @heldReply says which policy referred the call, so a facade
+  // gives reply (and the ids above) only to a caller it can confirm owns the
+  // session, and agent_reply to any other.
+  string agent_reply = 6;
+
+  // round_id is the held round's id (TurnHeld.round_id, contract 1.13.0).
+  string round_id = 7;
+}
+
+// TurnHeld is a turn that ended with tool calls outstanding. See
+// ServerMessage.turn_held.
+message TurnHeld {
+  // client_calls are the held calls the facade's client must answer, each a
+  // ToolCall with execution=CLIENT. They travel here, after the runtime has
+  // recorded the hold, and not as separate tool_call messages: a client that
+  // answers at once must find the hold already recorded. Empty on the TurnHeld
+  // that answers a held_call_outcomes message leaving calls outstanding: those
+  // calls were handed over already.
+  repeated ToolCall client_calls = 1;
+
+  // outstanding_call_ids are every call of the round still awaiting an
+  // outcome, client calls and calls the runtime holds itself alike.
+  repeated string outstanding_call_ids = 2;
+
+  // record_sequence_high_water is as on Done.
+  int64 record_sequence_high_water = 3;
+
+  // last_message_id is as on Done.
+  string last_message_id = 4;
+
+  // held_reply is the text a message sent to the session while it is held is
+  // answered with (ConversationHeld.reply), so a surface whose turn ends held
+  // can say so at once (contract 1.13.0): the A2A facade makes it the
+  // working task's status message. Empty on the TurnHeld that answers a
+  // held_call_outcomes message.
+  string held_reply = 5;
+
+  // referral_ids are as on ConversationHeld.
+  repeated string referral_ids = 6;
+
+  // agent_reply is as on ConversationHeld: the reply naming no policy, for a
+  // caller the facade cannot confirm owns the session (contract 1.13.0).
+  // Set whenever held_reply is.
+  string agent_reply = 7;
+
+  // expires_at_unix_ms is when the runtime stops keeping the held round, in
+  // Unix milliseconds (contract 1.13.0): its hold TTL, or later when a
+  // referral of it expires later. A surface that records the held turn for a
+  // caller who is not on the stream (an A2A task) keeps that record at least
+  // this long, and reports it failed if nothing completed it by then. Set
+  // whenever held_reply is.
+  int64 expires_at_unix_ms = 8;
+
+  // round_id is the runtime's id for the held round (contract 1.13.0):
+  // unique per round, unlike last_message_id, which a rewritten
+  // conversation could repeat. A facade that lets a caller answer the round's
+  // calls because its own turn was handed them sends it back as
+  // HeldCallOutcomes.round_id.
+  string round_id = 9;
+}
+
+// ToolActivity is one server-side tool call's progress. See
+// ServerMessage.tool_activity.
+message ToolActivity {
+  // call_id is the tool call's id, as the model issued it.
+  string call_id = 1;
+
+  // name is the tool's name.
+  string name = 2;
+
+  // phase is "retrying" (the call's connection to its backend failed and is
+  // being tried again; the call has not failed yet), "connected" (a call
+  // reported retrying connected after all and carries on; sent only after a
+  // "retrying") or "failed" (the call ended without a result; the model is
+  // told). An open set: a consumer ignores a phase it does not know.
+  string phase = 3;
+
+  // reason says why, in words for the person, e.g. "couldn't connect to the
+  // sandbox". From a fixed vocabulary; never the backend's error text, which
+  // can echo the call's arguments or the tool's output.
+  string reason = 4;
+
+  // attempt is the number of connection attempts made so far, for
+  // phase "retrying". Zero otherwise.
+  int32 attempt = 5;
+}
+
+// VoiceDisclosure is the outcome of a duplex session's audible AI disclosure.
+// See ServerMessage.voice_disclosure.
+message VoiceDisclosure {
+  // delivered is true when the disclosure audio was written to this stream.
+  bool delivered = 1;
+
+  // source names what was played: "clip" (the configured pre-recorded clip)
+  // or "tts" (the configured text, synthesised with the agent's tts
+  // provider). Empty when nothing was delivered.
+  string source = 2;
+
+  // reason says why nothing was delivered, e.g. "no tts provider and no
+  // clip". Empty when delivered.
+  string reason = 3;
+}
+
+// Heartbeat is a keepalive for an in-progress turn. See ServerMessage.heartbeat.
+message Heartbeat {}
+
+// Chunk contains a partial text response for streaming output.
+message Chunk {
+  // content is the text chunk to append to the response.
+  string content = 1;
+
+  // role identifies the speaker for this text chunk. Empty means the assistant
+  // (the default, back-compatible with text agents). "user" is used on the
+  // duplex path to carry the caller's transcribed speech so the client renders
+  // it as a user message rather than assistant output.
+  string role = 2;
+}
+
+// ToolExecution indicates where a tool is executed.
+enum ToolExecution {
+  // TOOL_EXECUTION_SERVER means the tool runs server-side in the runtime.
+  TOOL_EXECUTION_SERVER = 0;
+
+  // TOOL_EXECUTION_CLIENT means the tool must be fulfilled by the client.
+  TOOL_EXECUTION_CLIENT = 1;
+}
+
+// ToolCall represents a tool invocation.
+// For server-side tools this is informational (UI display only).
+// For client-side tools the client must send back a ClientToolResult.
+message ToolCall {
+  // id is a unique identifier for this tool call.
+  string id = 1;
+
+  // name is the name of the tool being called.
+  string name = 2;
+
+  // arguments_json contains the tool arguments as a JSON string.
+  string arguments_json = 3;
+
+  // execution indicates whether this tool runs server-side or client-side.
+  ToolExecution execution = 4;
+
+  // consent_message is a human-readable consent prompt for client-side tools.
+  string consent_message = 5;
+
+  // categories are semantic consent categories (e.g., "location", "filesystem").
+  repeated string categories = 6;
+}
+
+// ToolResult contains the result of a tool execution (informational for UI display).
+message ToolResult {
+  // id matches the corresponding ToolCall id.
+  string id = 1;
+
+  // result_json contains the tool result as a JSON string.
+  string result_json = 2;
+
+  // is_error indicates whether the tool execution failed.
+  bool is_error = 3;
+}
+
+// Done signals the completion of a conversation turn.
+message Done {
+  // final_content contains the complete response text (optional).
+  // For text-only responses, this contains the full response.
+  // For multimodal responses, use the parts field instead.
+  string final_content = 1;
+
+  // usage contains token usage statistics for this turn.
+  Usage usage = 2;
+
+  // parts contains multimodal content parts (text, images, audio, video).
+  // If non-empty, this takes precedence over final_content for rich responses.
+  repeated ContentPart parts = 3;
+
+  // record_sequence_high_water is the last ordering position the runtime
+  // recorded during this turn, so the facade can place the message that follows
+  // AFTER everything the runtime just did rather than at the next integer.
+  //
+  // Without it the facade numbers the assistant message 2 when the runtime made
+  // fifty tool calls, and the transcript shows the answer before the work.
+  //
+  // Zero means the runtime recorded nothing ordered — including any runtime that
+  // does not implement sequencing at all. The facade then falls back to
+  // incrementing by one, which is coarse but never wrong about relative order.
+  int64 record_sequence_high_water = 4;
+
+  // finish_reason is why the turn's last model call stopped, in PromptKit's
+  // normalized vocabulary: "stop", "max_output_tokens", "tool_use", "safety",
+  // "refusal". Empty when the provider reported none. "max_output_tokens"
+  // means the reply was cut off at the Provider's output limit, a
+  // configuration choice rather than a failure.
+  string finish_reason = 5;
+
+  // degraded is true when the turn finished having lost tool calls it made:
+  // a server-side call that failed, or a tool PromptKit excluded from the
+  // model's tool set after repeated failures. "Completed" and "worked" are
+  // different claims.
+  bool degraded = 6;
+
+  // tool_calls_failed is how many of the turn's server-side tool calls ended
+  // without a result. Client tool calls the client declined are not counted.
+  int32 tool_calls_failed = 7;
+
+  // excluded_tools names the tools PromptKit dropped from the model's tool
+  // set after they failed twice in the turn, so the model could no longer
+  // call them for the rest of it.
+  repeated string excluded_tools = 8;
+
+  // last_message_id identifies the last message of the session's conversation
+  // once this turn is in it (contract 1.12.0): the cursor a client
+  // hands back to ReadTurns, as after_message_id, to read what it missed. An
+  // opaque string; empty when the runtime keeps no readable conversation
+  // state.
+  string last_message_id = 9;
+
+  // not_approved_reason is set on the Done of a turn resumed from a held round
+  // in which a referred tool call was not approved — rejected by an approver,
+  // or expired undecided (contract 1.13.0): what the model was told of
+  // the first such call, in call-id order. A facade completing held work for a
+  // caller who is not on the stream — an A2A task, a function invocation —
+  // ends it rejected (A2A) or failed (a function) with this reason instead of
+  // completed. Empty otherwise, including on every turn that was not resumed.
+  string not_approved_reason = 10;
+}
+
+// ContentPart represents a single piece of content in a multimodal message.
+message ContentPart {
+  // type indicates the content type: "text", "image", "audio", "video"
+  string type = 1;
+
+  // text contains text content (only set when type="text")
+  string text = 2;
+
+  // media contains media content (only set when type="image", "audio", or "video")
+  MediaContent media = 3;
+}
+
+// MediaContent represents media data (image, audio, video) in a message.
+message MediaContent {
+  // Exactly one of data or url should be set.
+
+  // data contains base64-encoded media data (for resolved file:// and mock:// URLs)
+  string data = 1;
+
+  // url contains the media URL (for http:// and https:// URLs that are passed through)
+  string url = 2;
+
+  // mime_type indicates the media format (e.g., "image/png", "audio/mp3")
+  string mime_type = 3;
+
+  // storage_ref is an opaque backend storage reference (e.g. "omnia://sessions/{id}/media/{mediaID}").
+  // When set, the runtime resolves it to media bytes at provider-call time via the injected media store.
+  string storage_ref = 4;
+}
+
+// Usage contains token usage and cost information.
+message Usage {
+  // input_tokens is the number of tokens in the input/prompt.
+  int32 input_tokens = 1;
+
+  // output_tokens is the number of tokens in the output/response.
+  int32 output_tokens = 2;
+
+  // cost_usd is the estimated cost in USD for this request.
+  float cost_usd = 3;
+}
+
+// Error represents an error that occurred during processing.
+message Error {
+  // code is a machine-readable error code.
+  string code = 1;
+
+  // message is a human-readable error description.
+  string message = 2;
+}
+
+// Interruption signals that the in-flight response was interrupted (e.g. the
+// user started speaking over the agent during a duplex session). The client
+// must clear any buffered audio playback immediately.
+message Interruption {}
+
+// MediaChunk contains a streaming media chunk for progressive media delivery.
+// All chunks sharing the same media_id belong to the same media stream.
+message MediaChunk {
+  // media_id is the unique identifier for this media stream.
+  string media_id = 1;
+
+  // sequence is the 0-indexed sequence number for ordering chunks.
+  int32 sequence = 2;
+
+  // is_last indicates this is the final chunk for this media stream.
+  bool is_last = 3;
+
+  // mime_type indicates the media format (e.g., "image/png", "audio/mp3").
+  string mime_type = 4;
+
+  // data contains raw media bytes (avoids base64 overhead in gRPC path).
+  bytes data = 5;
+}
+
+// InvocationRequest carries a Function call from the facade.
+message InvocationRequest {
+  // input_json is the raw JSON payload submitted by the caller. The facade
+  // has already validated this against AgentRuntime.spec.inputSchema; the
+  // runtime treats it as an opaque user message body.
+  string input_json = 1;
+
+  // invocation_id is a UUID for this Function call, used for log and
+  // trace correlation. Assigned by the facade.
+  string invocation_id = 2;
+
+  // metadata carries optional key-value context (caller identity, auth
+  // subject, custom headers). Not interpreted by the runtime.
+  map<string, string> metadata = 3;
+
+  // record_sequence_base is the position the runtime should number its recorded
+  // records from — the same contract as ClientMessage.record_sequence_base, for
+  // the one-shot Function path.
+  //
+  // It was missing here for a release, and the effect was visible: a Function
+  // invocation recorded its user turn at 0 and its assistant turn at 1 while
+  // the runtime numbered its tool calls from its own base, so EVERY tool call
+  // sorted after the final answer and the transcript showed the work happening
+  // after the conclusion it produced.
+  //
+  // Zero on the first message of a session, and from a caller that does not
+  // track ordering. A runtime that supplies no sequence ignores it.
+  int64 record_sequence_base = 4;
+}
+
+// InvocationResponse carries the runtime's reply to the facade. On
+// success the facade then validates output_json against
+// AgentRuntime.spec.outputSchema before returning to the HTTP caller.
+message InvocationResponse {
+  // output_json is the raw assistant text. The facade validates it
+  // against the output schema; if invalid, the facade returns HTTP 502
+  // with this raw payload in the response body.
+  string output_json = 1;
+
+  // usage contains token + cost statistics for the call.
+  Usage usage = 2;
+
+  // duration_ms is the wall-clock time spent executing in the runtime.
+  int32 duration_ms = 3;
+
+  // invocation_id echoes InvocationRequest.invocation_id for correlation.
+  string invocation_id = 4;
+
+  // record_sequence_high_water is the last ordering position the runtime
+  // recorded during this invocation — the same contract as
+  // Done.record_sequence_high_water, for the one-shot Function path.
+  //
+  // The facade advances to this BEFORE numbering the assistant turn, so the
+  // answer sorts after the tool calls that produced it.
+  //
+  // Zero means the runtime recorded nothing ordered — including any runtime
+  // that does not implement sequencing at all. The facade then falls back to
+  // incrementing by one, which is coarse but never wrong about relative order.
+  int64 record_sequence_high_water = 5;
+
+  // held is set, and output_json empty, when the invocation's turn ended with
+  // tool calls held (contract 1.13.0). The function has not finished:
+  // the facade answers its caller 202 with the invocation id, and the result
+  // is read back from the invocation's status once the hold is decided. A
+  // runtime may set it only on a call carrying x-omnia-held-conversations: 1:
+  // a facade built before 1.13.0 sends none, and would read the empty output
+  // as the answer.
+  InvocationHeld held = 6;
+}
+
+// InvocationHeld is a function invocation whose turn ended held. See
+// InvocationResponse.held.
+message InvocationHeld {
+  // reply, outstanding_call_ids and referral_ids are as on ConversationHeld.
+  string reply = 1;
+  repeated string outstanding_call_ids = 2;
+  repeated string referral_ids = 3;
+
+  // expires_at_unix_ms is as on TurnHeld (contract 1.13.0): the facade
+  // keeps the held invocation's record at least this long, and reports it
+  // failed if no decision completed it by then.
+  int64 expires_at_unix_ms = 4;
+
+  // last_message_id is as on TurnHeld (contract 1.13.0): the cursor
+  // the round was held at, which ReadTurns reads the resumed turn after.
+  string last_message_id = 5;
+  // round_id is as on TurnHeld (contract 1.13.0): the round's
+  // id, which a facade matches its held work against.
+  string round_id = 6;
+}
+
+// HealthRequest is an empty message for health checks.
+message HealthRequest {}
+
+// HealthResponse contains the health status of the runtime.
+message HealthResponse {
+  // healthy indicates whether the runtime is ready to handle requests.
+  bool healthy = 1;
+
+  // status provides additional status information.
+  string status = 2;
+
+  // contract_version is the omnia.runtime.v1 contract version this runtime
+  // was built against, as a semver string (see the Contract-Version marker at
+  // the top of this file). A runtime that reports an empty value predates
+  // contract versioning and must be treated as unversioned.
+  string contract_version = 3;
+
+  // capabilities lists the contract features this runtime implements (e.g.
+  // "invoke", "duplex_audio", "client_tools"). An OPEN set — consumers must
+  // display/ignore names they don't recognize. Empty => a pre-negotiation
+  // (legacy) runtime.
+  repeated string capabilities = 4;
+}
+
+// ReadTurnsRequest names a session and the last message its reader saw.
+message ReadTurnsRequest {
+  // session_id is the conversation to read.
+  string session_id = 1;
+
+  // after_message_id is the last message the reader saw (Done.last_message_id
+  // or ReadTurnsResponse.last_message_id); empty reads from the start.
+  string after_message_id = 2;
+}
+
+// ReadTurnsResponse is a session's conversation after a given message.
+message ReadTurnsResponse {
+  // turns are every message after after_message_id, in order.
+  repeated TurnMessage turns = 1;
+
+  // held_client_calls are the session's held CLIENT tool calls still awaiting
+  // an outcome (see TurnHeld), so a reconnecting client can answer them.
+  repeated ToolCall held_client_calls = 2;
+
+  // last_message_id is the conversation's last message now: the cursor for
+  // the next read.
+  string last_message_id = 3;
+
+  // held_round is the session's held round, when it has one (contract
+  // 1.13.0): what it waits on, and the cursor it was held at
+  // (TurnHeld.last_message_id). A facade completing held work for a caller
+  // not on the stream reads it to tell a round still waiting, or a resumed
+  // turn held again, from one that is over.
+  HeldRound held_round = 4;
+
+  // resumed_round is how the round held at after_message_id ended, when the
+  // runtime resumed it (contract 1.13.0): the runtime's own verdict on
+  // the round, for a facade recovering a result it could not record. Empty
+  // when that round was not resumed, or its record has expired.
+  ResumedRound resumed_round = 5;
+
+  // held_round_id is the session's held round's id (TurnHeld.round_id),
+  // empty when none is held (contract 1.13.0).
+  string held_round_id = 6;
+}
+
+// HeldRound is a session's held round. See ReadTurnsResponse.held_round.
+message HeldRound {
+  // last_message_id is the cursor the round was held at, as
+  // TurnHeld.last_message_id reported it.
+  string last_message_id = 1;
+  // outstanding_call_ids, referral_ids, held_reply, agent_reply and
+  // expires_at_unix_ms are as on TurnHeld.
+  repeated string outstanding_call_ids = 2;
+  repeated string referral_ids = 3;
+  string held_reply = 4;
+  string agent_reply = 5;
+  int64 expires_at_unix_ms = 6;
+  // round_id is the round's id, as TurnHeld.round_id: what a facade
+  // matches its held work against, before the cursor.
+  string round_id = 7;
+}
+
+// ResumedRound is how a resumed held round ended. See
+// ReadTurnsResponse.resumed_round.
+message ResumedRound {
+  // not_approved_reason is as on Done: set when a referred call of the round
+  // was not approved.
+  string not_approved_reason = 1;
+  // failed is set when the resumed turn failed after the round's answers
+  // reached the conversation; error says how.
+  bool failed = 2;
+  string error = 3;
+}
+
+// TurnMessage is one message of a conversation, as ReadTurns returns it. It
+// carries what a client renders, and never a server-side tool call's
+// arguments or result.
+message TurnMessage {
+  // id is this message's cursor (see Done.last_message_id).
+  string id = 1;
+
+  // role is "user", "assistant", "tool" or "system".
+  string role = 2;
+
+  // content is the message's text.
+  string content = 3;
+
+  // tool_call_ids are the ids of the tool calls an assistant message made.
+  repeated string tool_call_ids = 4;
+
+  // parts are an assistant message's media (images, audio, documents), as
+  // Done.parts carries them, so a reply that was all media can be replayed.
+  repeated ContentPart parts = 5;
+
+  // annotation is the ClientMessage.annotation the facade attached to this
+  // user message, byte for byte (contract 1.14.0). Empty on every other
+  // message, and on a user message sent without one.
+  bytes annotation = 6;
+}
+
+// HasConversationRequest asks whether one session's context is resumable.
+message HasConversationRequest {
+  // session_id is the conversation id to probe.
+  string session_id = 1;
+}
+
+// ResumeState is the disposition of a session's working context.
+//
+// The three states exist because the facade must act differently on each: a
+// missing conversation is a client-visible expiry, whereas an unreachable
+// store is a server fault. Collapsing them would recreate the bug this RPC
+// exists to fix — telling a client its session expired when in fact the
+// context is intact and the store was merely briefly unreachable.
+enum ResumeState {
+  // Unset. Treated as RESUME_STATE_UNAVAILABLE by callers.
+  RESUME_STATE_UNSPECIFIED = 0;
+
+  // Context is present; sdk.Resume will succeed.
+  RESUME_STATE_RESUMABLE = 1;
+
+  // Store answered definitively that no context exists for this id — it
+  // expired, or was never persisted. The session cannot be continued.
+  RESUME_STATE_NOT_FOUND = 2;
+
+  // The store could not be consulted (unreachable, timed out, or no store is
+  // configured). Resumability is unknown; this is NOT an expiry.
+  RESUME_STATE_UNAVAILABLE = 3;
+}
+
+// HasConversationResponse reports one session's resume disposition.
+message HasConversationResponse {
+  // state is the disposition of the session's working context.
+  ResumeState state = 1;
+
+  // detail carries store-level error text when state is
+  // RESUME_STATE_UNAVAILABLE. Diagnostic only; never surfaced to end clients.
+  string detail = 2;
+}
+
+// EndConversationRequest names the conversation that ended.
+message EndConversationRequest {
+  // session_id is the conversation id that ended.
+  string session_id = 1;
+}
+
+// EndConversationResponse acknowledges an EndConversation. It carries nothing:
+// the signal is best-effort and its effects are the runtime's own.
+message EndConversationResponse {}
+
+// EraseConversationRequest names the conversation to erase.
+message EraseConversationRequest {
+  // session_id is the conversation id to erase.
+  string session_id = 1;
+}
+
+// EraseConversationResponse acknowledges an EraseConversation: everything the
+// runtime kept for the session is gone.
+message EraseConversationResponse {}
+
+// WatchInvocationRequest names the invocation to watch.
+message WatchInvocationRequest {
+  // invocation_id is the InvocationRequest.invocation_id the facade will use
+  // for the Invoke call it makes after the watch is ready.
+  string invocation_id = 1;
+}
+
+// InvocationProgress is one event on a WatchInvocation stream.
+message InvocationProgress {
+  oneof event {
+    // ready is always the first message: the watch is registered, so an
+    // Invoke started after it is received loses no events.
+    InvocationWatchReady ready = 1;
+    // tool_call: the model asked for a tool and the runtime started it.
+    InvocationToolCall tool_call = 2;
+    // tool_result: a tool call finished, successfully or not.
+    InvocationToolResult tool_result = 3;
+  }
+  // There is deliberately no assistant-text variant. Raw provider deltas would
+  // reach the caller before any whole-message guardrail ran on the final
+  // message, and would expose the tool loop's narration, which the function's
+  // output deliberately omits.
+}
+
+// InvocationWatchReady acknowledges a WatchInvocation. It carries nothing.
+message InvocationWatchReady {}
+
+// InvocationToolCall reports a tool call starting. It deliberately carries no
+// arguments: the watcher is a progress view, and the arguments are recorded
+// on the session's tool_calls, where their retention and privacy rules apply.
+message InvocationToolCall {
+  // call_id is the provider's tool-call id, matching InvocationToolResult.
+  string call_id = 1;
+  // name is the tool's name.
+  string name = 2;
+}
+
+// InvocationToolResult reports a tool call finishing. Like InvocationToolCall
+// it carries no payload — only whether the call worked and how long it took.
+message InvocationToolResult {
+  // call_id matches the InvocationToolCall it completes.
+  string call_id = 1;
+  // name is the tool's name.
+  string name = 2;
+  // ok is false when the tool failed or a policy denied it.
+  bool ok = 3;
+  // duration_ms is how long the tool ran.
+  int64 duration_ms = 4;
+}
+
+// DuplexStart opens a bidirectional audio session on a Converse stream.
+message DuplexStart {
+  // codec is the audio encoding, e.g. "pcm".
+  string codec = 1;
+  // sample_rate in Hz, e.g. 16000.
+  int32 sample_rate = 2;
+  // channels, e.g. 1 for mono.
+  int32 channels = 3;
+  // system_instruction is the optional system prompt for the session.
+  string system_instruction = 4;
+}
+
+// RuntimeHello is the runtime's first ServerMessage on a Converse stream. It
+// carries the session's authoritative capability set and, for a duplex session,
+// the media parameters the runtime requires — a bounded counter-offer to the
+// facade's DuplexStart proposal. Absence of a hello marks a legacy runtime.
+message RuntimeHello {
+  // capabilities is the per-session, authoritative capability set (open set;
+  // consumers display or ignore unknown values).
+  repeated string capabilities = 1;
+  // media is the bounded media counter-offer. Set only for a duplex session.
+  MediaNegotiation media = 2;
+  // voice_mode is how a duplex session actually runs, as decided at session
+  // open after any automatic selection: provider-native audio streaming
+  // (realtime) or STT -> LLM -> TTS (cascaded). Set only for a duplex session;
+  // UNSPECIFIED on the text path and from runtimes that predate the field.
+  VoiceMode voice_mode = 3;
+}
+
+// VoiceMode is the pipeline a duplex (voice) session runs through.
+enum VoiceMode {
+  // VOICE_MODE_UNSPECIFIED means not a duplex session, or not reported.
+  VOICE_MODE_UNSPECIFIED = 0;
+  // VOICE_MODE_REALTIME streams audio to and from the model natively.
+  VOICE_MODE_REALTIME = 1;
+  // VOICE_MODE_CASCADED transcribes speech, runs a text LLM turn, then
+  // synthesises the reply, which adds latency to every turn.
+  VOICE_MODE_CASCADED = 2;
+}
+
+// MediaNegotiation is the bounded counter-offer parameter set. A zero value for
+// a field means "no requirement / accept the client's proposal" for that field.
+message MediaNegotiation {
+  // codec is the required audio encoding, e.g. "pcm".
+  string codec = 1;
+  // sample_rate is the required sample rate in Hz, e.g. 24000.
+  int32 sample_rate = 2;
+  // channels is the required channel count, e.g. 1 for mono.
+  int32 channels = 3;
+  // frame_rate is the required video frame rate (carried, not yet enforced).
+  int32 frame_rate = 4;
+  // resolution is the required video resolution (carried, not yet enforced).
+  int32 resolution = 5;
+}
+
+// AudioInputChunk is one inbound audio frame during a duplex session.
+message AudioInputChunk {
+  // data is raw audio bytes (never base64 on the gRPC path).
+  bytes data = 1;
+  // sequence is the 0-indexed frame number.
+  uint32 sequence = 2;
+  // is_last marks the final frame (client hangup / stream end).
+  bool is_last = 3;
+}
