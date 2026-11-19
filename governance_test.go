@@ -55,20 +55,20 @@ func TestDecide_CarriesTheCallAndReturnsTheRelaysDecision(t *testing.T) {
 	g := governed(t, map[dialhome.StreamKind]http.Handler{
 		dialhome.KindPolicy: jsonHandler(t, dialhome.PolicyDecisionPath, func(b map[string]any) (int, any) {
 			got = b
-			return http.StatusOK, dialhome.PolicyDecision{Allow: false, Reason: "over the limit", DeniedBy: "r1"}
+			return http.StatusOK, dialhome.PolicyDecision{Allow: false, Reason: "above the limit", DeniedBy: "r1"}
 		}),
 	})
 	d, err := g.Decide(context.Background(), dialhome.PolicyRequest{
-		SessionID: "s1", CallID: "c1", Tool: "raise_work_order", Registry: "site-tools",
-		Arguments: json.RawMessage(`{"estimated_cost_gbp":48000}`),
+		SessionID: "s1", CallID: "c1", Tool: "open_ticket", Registry: "site-tools",
+		Arguments: json.RawMessage(`{"amount":5000}`),
 	})
 	require.NoError(t, err)
 	assert.False(t, d.Allow)
-	assert.Equal(t, "over the limit", d.Reason)
+	assert.Equal(t, "above the limit", d.Reason)
 	assert.Equal(t, "r1", d.DeniedBy)
 	assert.Equal(t, "s1", got["session_id"])
 	assert.Equal(t, "site-tools", got["registry"])
-	assert.Equal(t, map[string]any{"estimated_cost_gbp": float64(48000)}, got["arguments"])
+	assert.Equal(t, map[string]any{"amount": float64(5000)}, got["arguments"])
 }
 
 func TestDecide_NoAnswerIsAnErrorNeverAnAllow(t *testing.T) {
@@ -119,7 +119,7 @@ func TestRecordToolCall_PostsTheRecord(t *testing.T) {
 		}),
 	})
 	require.NoError(t, g.RecordToolCall(context.Background(), dialhome.ToolCallRecord{
-		SessionID: "s1", CallID: "c1", Tool: "read_scada", Phase: dialhome.ToolCallCompleted,
+		SessionID: "s1", CallID: "c1", Tool: "read_sensor", Phase: dialhome.ToolCallCompleted,
 		Result: "ok", DurationMs: 12, Time: time.Now(),
 	}))
 	b := <-got
@@ -172,4 +172,24 @@ func TestMemory_ARefusalCarriesTheRelaysWords(t *testing.T) {
 	_, err := g.Remember(context.Background(), "s1", dialhome.MemoryRecord{Content: "x"})
 	require.Error(t, err)
 	assert.Equal(t, "not stored: the user has not consented", err.Error())
+}
+
+func TestDecide_AnAnswerThatIsNotADecisionIsNotAnAllow(t *testing.T) {
+	for name, h := range map[string]http.HandlerFunc{
+		"empty object": func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{}`)) },
+		"malformed":    func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"allow":tr`)) },
+		"no content":   func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) },
+		"a redirect": func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, dialhome.PolicyDecisionPath+"?again", http.StatusTemporaryRedirect)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := governed(t, map[dialhome.StreamKind]http.Handler{dialhome.KindPolicy: h})
+			d, err := g.Decide(context.Background(), dialhome.PolicyRequest{SessionID: "s", Tool: "t"})
+			assert.False(t, d.Allow)
+			if name != "empty object" {
+				assert.ErrorIs(t, err, dialhome.ErrNoDecision)
+			}
+		})
+	}
 }

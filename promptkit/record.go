@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AltairaLabs/PromptKit/runtime/v2/events"
@@ -22,9 +23,15 @@ type Recorder interface {
 	RecordToolCall(ctx context.Context, rec dialhome.ToolCallRecord) error
 }
 
-// recordTimeout bounds one record. Recording never holds a turn up: it runs
-// off the conversation's event bus, after the fact.
+// recordTimeout bounds one record. Recording never holds a turn up, or the
+// event bus: the bus listener only queues, and a goroutine of the
+// conversation's own sends.
 const recordTimeout = 15 * time.Second
+
+// recordQueue bounds the records waiting to be sent. A record that finds it
+// full is dropped and logged rather than block the bus, which disables a
+// listener that keeps it waiting.
+const recordQueue = 256
 
 // toolStatusFailed is PromptKit's completed-with-failure status. A tool that
 // returns a failure is reported on tool.call.completed, not tool.call.failed.
@@ -35,29 +42,65 @@ const toolStatusPending = "pending"
 
 // recordToolCalls subscribes to conv's tool call events and records each one
 // through rec, except the client tools (the client's answer is its own
-// record). A call the policy refused raises no event: the relay that refused
-// it records it.
+// record). A call refused before it ran raises no event: one the policy
+// refused is recorded by the relay that refused it, and one PromptKit's own
+// pack blocklist refused is recorded by nobody.
 func recordToolCalls(conv *sdk.Conversation, sessionID string, rec Recorder, client map[string]bool, log logr.Logger) {
 	bus := conv.EventBus()
 	if bus == nil {
 		log.Info("tool calls not recorded: the conversation has no event bus", "sessionID", sessionID)
 		return
 	}
-	// One subscription for all three kinds, so a call's phases are recorded
+	queue := make(chan dialhome.ToolCallRecord, recordQueue)
+	done := make(chan struct{})
+	go sendRecords(queue, done, rec, log)
+	// One subscription for all three kinds, so a call's phases are queued
 	// in the order they happened.
 	unsubscribe := bus.SubscribeAll(func(e *events.Event) {
 		r, ok := toolCallRecord(e, sessionID)
 		if !ok || client[r.Tool] {
 			return
 		}
+		select {
+		case queue <- r:
+		default:
+			log.Info("tool call not recorded: too many records waiting", "sessionID", sessionID,
+				"tool", r.Tool, "phase", r.Phase)
+		}
+	})
+	var once sync.Once
+	conv.OwnSubscription(func() {
+		unsubscribe()
+		once.Do(func() { close(done) })
+	})
+}
+
+// sendRecords sends queued records in order until done, then sends what is
+// still queued and returns.
+func sendRecords(queue <-chan dialhome.ToolCallRecord, done <-chan struct{}, rec Recorder, log logr.Logger) {
+	send := func(r dialhome.ToolCallRecord) {
 		ctx, cancel := context.WithTimeout(context.Background(), recordTimeout)
 		defer cancel()
 		if err := rec.RecordToolCall(ctx, r); err != nil {
-			log.Info("tool call not recorded", "sessionID", sessionID, "tool", r.Tool,
+			log.Info("tool call not recorded", "sessionID", r.SessionID, "tool", r.Tool,
 				"phase", r.Phase, "err", err.Error())
 		}
-	})
-	conv.OwnSubscription(unsubscribe)
+	}
+	for {
+		select {
+		case r := <-queue:
+			send(r)
+		case <-done:
+			for {
+				select {
+				case r := <-queue:
+					send(r)
+				default:
+					return
+				}
+			}
+		}
+	}
 }
 
 // toolCallRecord converts a tool call event, or reports false for any other.

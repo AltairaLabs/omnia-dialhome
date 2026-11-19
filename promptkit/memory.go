@@ -6,6 +6,7 @@ package promptkit
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/AltairaLabs/PromptKit/runtime/v2/memory"
 	"github.com/AltairaLabs/PromptKit/runtime/v2/types"
@@ -32,6 +33,27 @@ const memorySubject = "session-user"
 
 // retrievalLimit bounds the memories recalled into a turn's context.
 const retrievalLimit = 5
+
+// retrievalTimeout bounds the recall into a turn's context, which runs before
+// every model call: a slow relay costs the turn its memories, not its time.
+const retrievalTimeout = 2 * time.Second
+
+// errMemoryUnavailable is what the model is told of a memory failure the
+// relay did not word itself: never the transport's internals.
+var errMemoryUnavailable = errors.New("memory is unavailable right now")
+
+// modelError is err as the model may see it: the relay's own words when it
+// answered, else errMemoryUnavailable.
+func modelError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var re *dialhome.RelayError
+	if errors.As(err, &re) && re.Message != "" {
+		return errors.New(re.Message)
+	}
+	return errMemoryUnavailable
+}
 
 // errForgetAll is DeleteAll: erasing a user's memory is not the agent's to do.
 var errForgetAll = errors.New("forgetting every memory is not available to the agent")
@@ -74,9 +96,10 @@ var (
 func (s *memoryStore) Save(ctx context.Context, m *memory.Memory) error {
 	id, err := s.svc.Remember(ctx, s.sessionID, dialhome.MemoryRecord{
 		Type: m.Type, Content: m.Content, Metadata: m.Metadata, Confidence: m.Confidence,
+		ExpiresAt: m.ExpiresAt,
 	})
 	if err != nil {
-		return err
+		return modelError(err)
 	}
 	m.ID = id
 	return nil
@@ -90,7 +113,7 @@ func (s *memoryStore) Retrieve(
 		SessionID: s.sessionID, Query: query, Types: opts.Types,
 		Limit: opts.Limit, MinConfidence: opts.MinConfidence,
 	})
-	return toMemories(recs), err
+	return toMemories(recs), modelError(err)
 }
 
 // List implements memory.Store.
@@ -98,12 +121,12 @@ func (s *memoryStore) List(ctx context.Context, _ map[string]string, opts memory
 	recs, err := s.svc.ListMemories(ctx, dialhome.MemoryListRequest{
 		SessionID: s.sessionID, Types: opts.Types, Limit: opts.Limit, Offset: opts.Offset,
 	})
-	return toMemories(recs), err
+	return toMemories(recs), modelError(err)
 }
 
 // Delete implements memory.Store.
 func (s *memoryStore) Delete(ctx context.Context, _ map[string]string, id string) error {
-	return s.svc.Forget(ctx, s.sessionID, id)
+	return modelError(s.svc.Forget(ctx, s.sessionID, id))
 }
 
 // DeleteAll implements memory.Store. It is always refused.
@@ -118,8 +141,10 @@ func (s *memoryStore) RetrieveContext(
 	if q == "" {
 		return nil, nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, retrievalTimeout)
+	defer cancel()
 	recs, err := s.svc.Recall(ctx, dialhome.MemoryRecallRequest{SessionID: s.sessionID, Query: q, Limit: retrievalLimit})
-	return toMemories(recs), err
+	return toMemories(recs), modelError(err)
 }
 
 func lastUserText(msgs []types.Message) string {
@@ -139,7 +164,7 @@ func toMemories(recs []dialhome.MemoryRecord) []*memory.Memory {
 	for _, r := range recs {
 		out = append(out, &memory.Memory{
 			ID: r.ID, Type: r.Type, Content: r.Content, Metadata: r.Metadata,
-			Confidence: r.Confidence, CreatedAt: r.CreatedAt,
+			Confidence: r.Confidence, CreatedAt: r.CreatedAt, ExpiresAt: r.ExpiresAt,
 		})
 	}
 	return out

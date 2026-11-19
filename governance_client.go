@@ -59,6 +59,9 @@ func NewGovernance(c StreamOpener) *Governance {
 // that has since dropped.
 func streamHTTPClient(c StreamOpener, kind StreamKind) *http.Client {
 	return &http.Client{
+		// A redirect is not an answer: it fails the request, and a policy
+		// request that fails is a refusal.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		Transport: &http.Transport{
 			DialContext: func(context.Context, string, string) (net.Conn, error) {
 				return c.OpenStream(kind)

@@ -6,9 +6,9 @@ package promptkit
 import (
 	"context"
 	"errors"
-	"strings"
 
 	"github.com/AltairaLabs/PromptKit/runtime/v2/hooks"
+	"github.com/AltairaLabs/PromptKit/runtime/v2/memory"
 	"github.com/go-logr/logr"
 
 	dialhome "github.com/AltairaLabs/omnia-dialhome"
@@ -19,10 +19,13 @@ type Decider interface {
 	Decide(ctx context.Context, req dialhome.PolicyRequest) (dialhome.PolicyDecision, error)
 }
 
-// memoryToolPrefix names PromptKit's memory tools. They are not put to the
-// tool policy: they reach memory only through the relay, which scopes and
-// refuses them itself.
-const memoryToolPrefix = "memory__"
+// relayMemoryTools are PromptKit's memory tools. With Config.Memory set they
+// are not put to the tool policy: they reach memory only through the relay,
+// which scopes and refuses them itself. Any other tool, whatever its name,
+// is put to the policy.
+var relayMemoryTools = []string{
+	memory.RecallToolName, memory.RememberToolName, memory.ListToolName, memory.ForgetToolName,
+}
 
 // policyGate is a PromptKit tool hook that asks the Decider before every tool
 // the pack runs in this process, and lets it run only on an allow. One per
@@ -44,7 +47,7 @@ func (g *policyGate) Name() string { return "omnia-dialhome-policy" }
 // the tool's error, carrying the policy's message. No answer is a refusal:
 // the channel down, a timeout, a relay that cannot decide.
 func (g *policyGate) BeforeExecution(ctx context.Context, req hooks.ToolRequest) hooks.Decision {
-	if g.exempt[req.Name] || strings.HasPrefix(req.Name, memoryToolPrefix) {
+	if g.exempt[req.Name] {
 		return hooks.Allow
 	}
 	d, err := g.decider.Decide(ctx, dialhome.PolicyRequest{
@@ -76,8 +79,15 @@ func (g *policyGate) AfterExecution(context.Context, hooks.ToolRequest, hooks.To
 // tool did not run, and why in a word, never the transport's internals.
 func noDecisionReason(err error) string {
 	var re *dialhome.RelayError
-	if errors.As(err, &re) && re.Message != "" {
+	switch {
+	case errors.As(err, &re) && re.Message != "":
 		return "the tool did not run: no policy decision could be obtained (" + re.Message + ")"
+	case errors.Is(err, dialhome.ErrNotConnected):
+		return "the tool did not run: the connection to Omnia is down, and a tool runs only when Omnia allows it"
+	default:
+		// A timeout, an answer that was not a decision, or a relay that does
+		// not decide tool calls at all: which one is not knowable here, and
+		// the last never recovers on its own, so promise nothing.
+		return "the tool did not run: Omnia gave no policy decision for it, and a tool runs only when Omnia allows it"
 	}
-	return "the tool did not run: no policy decision could be obtained, so it is refused until the connection to Omnia is back"
 }

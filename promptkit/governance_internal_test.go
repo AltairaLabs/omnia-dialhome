@@ -40,25 +40,25 @@ func TestPolicyGate_AsksForEveryLocalToolAndFollowsTheAnswer(t *testing.T) {
 		return dialhome.PolicyDecision{Allow: true}, nil
 	})
 	d := g.BeforeExecution(context.Background(), hooks.ToolRequest{
-		Name: "raise_work_order", CallID: "c1", Args: json.RawMessage(`{"estimated_cost_gbp":6400}`)})
+		Name: "open_ticket", CallID: "c1", Args: json.RawMessage(`{"amount":100}`)})
 	assert.True(t, d.Allow)
-	assert.Equal(t, dialhome.PolicyRequest{SessionID: "s1", CallID: "c1", Tool: "raise_work_order",
-		Registry: "site-tools", Arguments: json.RawMessage(`{"estimated_cost_gbp":6400}`)}, asked)
+	assert.Equal(t, dialhome.PolicyRequest{SessionID: "s1", CallID: "c1", Tool: "open_ticket",
+		Registry: "site-tools", Arguments: json.RawMessage(`{"amount":100}`)}, asked)
 }
 
 func TestPolicyGate_ARefusalCarriesThePolicysMessage(t *testing.T) {
 	g := gate(func(context.Context, dialhome.PolicyRequest) (dialhome.PolicyDecision, error) {
-		return dialhome.PolicyDecision{Allow: false, Reason: "above the site limit", DeniedBy: "deny-above-limit"}, nil
+		return dialhome.PolicyDecision{Allow: false, Reason: "above the limit", DeniedBy: "deny-above-limit"}, nil
 	})
-	d := g.BeforeExecution(context.Background(), hooks.ToolRequest{Name: "raise_work_order"})
+	d := g.BeforeExecution(context.Background(), hooks.ToolRequest{Name: "open_ticket"})
 	assert.False(t, d.Allow)
-	assert.Equal(t, "above the site limit", d.Reason)
+	assert.Equal(t, "above the limit", d.Reason)
 	assert.Equal(t, "deny-above-limit", d.Metadata["denied_by"])
 
 	g = gate(func(context.Context, dialhome.PolicyRequest) (dialhome.PolicyDecision, error) {
 		return dialhome.PolicyDecision{}, nil
 	})
-	d = g.BeforeExecution(context.Background(), hooks.ToolRequest{Name: "raise_work_order"})
+	d = g.BeforeExecution(context.Background(), hooks.ToolRequest{Name: "open_ticket"})
 	assert.False(t, d.Allow, "a decision that does not say allow is a refusal")
 	assert.NotEmpty(t, d.Reason)
 }
@@ -74,41 +74,47 @@ func TestPolicyGate_NoDecisionIsARefusal(t *testing.T) {
 			g := gate(func(context.Context, dialhome.PolicyRequest) (dialhome.PolicyDecision, error) {
 				return dialhome.PolicyDecision{Allow: true}, err // an allow beside an error is not an allow
 			})
-			d := g.BeforeExecution(context.Background(), hooks.ToolRequest{Name: "read_scada"})
+			d := g.BeforeExecution(context.Background(), hooks.ToolRequest{Name: "read_sensor"})
 			assert.False(t, d.Allow)
 			assert.Contains(t, d.Reason, "did not run")
 		})
 	}
 }
 
-func TestPolicyGate_ClientAndMemoryToolsAreNotPutToIt(t *testing.T) {
-	g := gate(func(context.Context, dialhome.PolicyRequest) (dialhome.PolicyDecision, error) {
-		t.Fatal("asked")
+func TestPolicyGate_OnlyTheExemptToolsAreNotPutToIt(t *testing.T) {
+	var asked []string
+	g := gate(func(_ context.Context, r dialhome.PolicyRequest) (dialhome.PolicyDecision, error) {
+		asked = append(asked, r.Tool)
 		return dialhome.PolicyDecision{}, nil
 	})
+	for _, n := range relayMemoryTools {
+		g.exempt[n] = true
+	}
 	assert.True(t, g.BeforeExecution(context.Background(), hooks.ToolRequest{Name: "get_location"}).Allow)
 	assert.True(t, g.BeforeExecution(context.Background(), hooks.ToolRequest{Name: "memory__recall"}).Allow)
+	assert.False(t, g.BeforeExecution(context.Background(), hooks.ToolRequest{Name: "memory__export"}).Allow)
+	assert.Equal(t, []string{"memory__export"}, asked)
 	assert.True(t, g.AfterExecution(context.Background(), hooks.ToolRequest{}, hooks.ToolResponse{}).Allow)
 	assert.NotEmpty(t, g.Name())
 }
 
 func TestToolCallRecord_Phases(t *testing.T) {
 	ts := time.Date(2026, 11, 19, 9, 0, 0, 0, time.UTC)
-	text := "Raised WO-WE-0412"
+	text := "Raised ticket 1042"
 	ev := func(typ events.EventType, d events.ToolCallEventData) *events.Event {
 		return &events.Event{Type: typ, Timestamp: ts, Data: &d}
 	}
 
 	r, ok := toolCallRecord(ev(events.EventToolCallStarted, events.ToolCallEventData{
-		ToolName: "raise_work_order", CallID: "c1", Args: map[string]any{"asset": "WE-T07"}, Round: 1}), "s1")
+		ToolName: "open_ticket", CallID: "c1", Args: map[string]any{"asset": "pump-2"}, Round: 1}), "s1")
 	require.True(t, ok)
 	assert.Equal(t, dialhome.ToolCallStarted, r.Phase)
-	assert.JSONEq(t, `{"asset":"WE-T07"}`, string(r.Arguments))
+	assert.JSONEq(t, `{"asset":"pump-2"}`, string(r.Arguments))
 	assert.Equal(t, 1, r.Round)
 	assert.Equal(t, ts, r.Time)
 
 	r, ok = toolCallRecord(ev(events.EventToolCallCompleted, events.ToolCallEventData{
-		ToolName: "raise_work_order", CallID: "c1", Status: "success", Duration: 30 * time.Millisecond,
+		ToolName: "open_ticket", CallID: "c1", Status: "success", Duration: 30 * time.Millisecond,
 		Parts: []types.ContentPart{{Type: "text", Text: &text}}}), "s1")
 	require.True(t, ok)
 	assert.Equal(t, dialhome.ToolCallCompleted, r.Phase)
@@ -116,15 +122,15 @@ func TestToolCallRecord_Phases(t *testing.T) {
 	assert.Equal(t, int64(30), r.DurationMs)
 
 	r, ok = toolCallRecord(ev(events.EventToolCallCompleted, events.ToolCallEventData{
-		ToolName: "read_scada", CallID: "c2", Status: "failed", Parts: []types.ContentPart{{Type: "text", Text: &text}}}), "s1")
+		ToolName: "read_sensor", CallID: "c2", Status: "failed", Parts: []types.ContentPart{{Type: "text", Text: &text}}}), "s1")
 	require.True(t, ok)
 	assert.Equal(t, dialhome.ToolCallFailed, r.Phase, "a completed call that failed is recorded as failed")
 	assert.Equal(t, text, r.Error)
 
 	r, ok = toolCallRecord(ev(events.EventToolCallFailed, events.ToolCallEventData{
-		ToolName: "read_scada", CallID: "c3", Error: errors.New("site unreachable")}), "s1")
+		ToolName: "read_sensor", CallID: "c3", Error: errors.New("sensor unreachable")}), "s1")
 	require.True(t, ok)
-	assert.Equal(t, "site unreachable", r.Error)
+	assert.Equal(t, "sensor unreachable", r.Error)
 
 	_, ok = toolCallRecord(ev(events.EventToolCallCompleted, events.ToolCallEventData{Status: "pending"}), "s1")
 	assert.False(t, ok, "a client tool handed to the client is not an outcome")
@@ -205,8 +211,12 @@ func TestMemoryStore_EveryOperationGoesToTheSession(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, got, "no user message, no recall")
 
-	f.err = errors.New("not stored: no consent")
-	assert.EqualError(t, s.Save(ctx, &memory.Memory{Content: "x"}), "not stored: no consent")
+	f.err = &dialhome.RelayError{Status: 422, Message: "not stored: no consent"}
+	assert.EqualError(t, s.Save(ctx, &memory.Memory{Content: "x"}), "not stored: no consent",
+		"the relay's words reach the model")
+	f.err = errors.New(`Post "http://dial-home/v1/memory/recall": dial-home: channel not connected`)
+	_, err = s.Retrieve(ctx, nil, "x", memory.RetrieveOptions{})
+	assert.ErrorIs(t, err, errMemoryUnavailable, "the transport's never do")
 }
 
 func TestMemoryOptions_FollowTheScope(t *testing.T) {

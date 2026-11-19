@@ -50,8 +50,8 @@
 //
 // # Governance over the channel
 //
-// A runtime that runs tools itself (a site agent's plant reads and work
-// orders) asks the relay before each one (Governance.Decide) and runs it only
+// A runtime that runs tools itself (reads and writes of systems only it can
+// reach) asks the relay before each one (Governance.Decide) and runs it only
 // on an allow; no answer, for any reason, is a refusal. It records each call
 // it ran (Governance.RecordToolCall); a call the relay refused, the relay
 // records itself. Memory is the relay's to scope: every request names only

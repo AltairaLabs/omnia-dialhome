@@ -115,6 +115,11 @@ type MemoryScope struct {
 }
 
 // MemoryRecord is one memory.
+//
+// On a remember, every field is the runtime's assertion, Metadata included
+// (PromptKit puts the provenance and the consent category there). A relay
+// treats them as claims to check or classify again, never as facts about the
+// user or their consent.
 type MemoryRecord struct {
 	ID         string         `json:"id,omitempty"`
 	Type       string         `json:"type,omitempty"`
@@ -122,6 +127,8 @@ type MemoryRecord struct {
 	Metadata   map[string]any `json:"metadata,omitempty"`
 	Confidence float64        `json:"confidence,omitempty"`
 	CreatedAt  time.Time      `json:"created_at,omitzero"`
+	// ExpiresAt, when set, is when the memory should be forgotten.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
 // MemoryRememberRequest saves a memory for the session's user.

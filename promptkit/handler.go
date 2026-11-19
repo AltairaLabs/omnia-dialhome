@@ -58,9 +58,13 @@ type Config struct {
 	IdleTTL time.Duration
 	// Policy, when set, decides every tool the pack runs in this process
 	// before it runs, and the tool runs only on an allow: a refusal, or no
-	// answer at all, reaches the model as the tool's error. Client tools and
-	// the memory tools are not put to it. Over dial-home, pass the channel's
-	// *dialhome.Governance.
+	// answer at all, reaches the model as the tool's error. Client tools are
+	// not put to it, nor, when Memory is set, PromptKit's four memory tools.
+	// Over dial-home, pass the channel's *dialhome.Governance.
+	//
+	// It is a PromptKit tool hook, so it covers the tool calls of a turn this
+	// handler runs. PromptKit runs no hooks for a duplex session's tools or a
+	// workflow's composed tool steps; this handler serves neither.
 	Policy Decider
 	// PolicyRegistry is the name this runtime's tools are governed under: a
 	// tool policy selects them by it (PolicyRequest.Registry).
@@ -69,8 +73,10 @@ type Config struct {
 	// its session: started, then completed or failed.
 	ToolCalls Recorder
 	// Memory, when set, gives each conversation the memory its session has,
-	// as the service scopes it. A conversation whose scope cannot be read
-	// opens without memory.
+	// as the service scopes it. The scope is read once, when the conversation
+	// opens; the service checks every request again. A conversation whose
+	// scope cannot be read opens without memory. Do not also pass
+	// sdk.WithMemory in Options: the conversation would get two memories.
 	Memory MemoryService
 	// Log receives conversation lifecycle events. Zero value discards.
 	Log logr.Logger

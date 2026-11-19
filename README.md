@@ -112,7 +112,7 @@ h, _ := promptkit.New(promptkit.Config{
 	PromptName:  "assistant",
 	ClientTools: []string{"get_location"},
 	Configure: func(conv *sdk.Conversation) error {
-		conv.OnTool("read_scada", readSCADA) // runs here, on site
+		conv.OnTool("read_sensor", readSensor) // runs here, on site
 		return nil
 	},
 })
@@ -134,11 +134,11 @@ h, _ := promptkit.New(promptkit.Config{
 	PackPath:       "agent.pack.json",
 	PromptName:     "assistant",
 	Policy:         gov,          // ask before every tool runs here
-	PolicyRegistry: "site-tools", // the name Omnia's policies select these tools by
+	PolicyRegistry: "local-tools", // the name Omnia's policies select these tools by
 	ToolCalls:      gov,          // record each call on the session
 	Memory:         gov,          // the session user's memory, as Omnia scopes it
 	Configure: func(conv *sdk.Conversation) error {
-		conv.OnTool("raise_work_order", raiseWorkOrder)
+		conv.OnTool("open_ticket", openTicket)
 		return nil
 	},
 })
@@ -149,7 +149,11 @@ h, _ := promptkit.New(promptkit.Config{
   model as the tool's error, carrying the policy's message, so the agent can
   tell the person why. No answer is a refusal too: with the channel down, a
   timeout, or a relay that cannot decide, the tool does not run. Client tools
-  and the memory tools are not put to it.
+  are not put to it, nor, when `Memory` is set, the four memory tools.
+
+  **Upgrading from v0.1.** A relay that predates policy decisions gives none,
+  so from v0.2.0 every tool the pack runs in this process is refused until the
+  relay is upgraded too. Client tools are unaffected.
 - **Tool calls.** Each call the pack ran here is recorded on its session:
   arguments when it starts, then its result or its error. A call Omnia
   refused is recorded by Omnia.

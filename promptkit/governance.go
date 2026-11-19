@@ -14,9 +14,15 @@ import (
 func (h *Handler) governanceOptions(ctx context.Context, id string) []sdk.Option {
 	var opts []sdk.Option
 	if h.cfg.Policy != nil {
+		exempt := h.clientTools()
+		if h.cfg.Memory != nil {
+			for _, n := range relayMemoryTools {
+				exempt[n] = true
+			}
+		}
 		opts = append(opts, sdk.WithToolHook(&policyGate{
 			decider: h.cfg.Policy, sessionID: id, registry: h.cfg.PolicyRegistry,
-			exempt: h.clientTools(), log: h.cfg.Log,
+			exempt: exempt, log: h.cfg.Log,
 		}))
 	}
 	if h.cfg.Memory != nil {

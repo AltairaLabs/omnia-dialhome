@@ -5,6 +5,7 @@ package promptkit_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,11 +13,14 @@ import (
 
 	"github.com/AltairaLabs/PromptKit/runtime/v2/providers"
 	"github.com/AltairaLabs/PromptKit/runtime/v2/providers/mock"
+	"github.com/AltairaLabs/PromptKit/runtime/v2/types"
 	"github.com/AltairaLabs/PromptKit/sdk/v2"
+	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	dialhome "github.com/AltairaLabs/omnia-dialhome"
+	"github.com/AltairaLabs/omnia-dialhome/internal/relaytest"
 	"github.com/AltairaLabs/omnia-dialhome/promptkit"
 	"github.com/AltairaLabs/omnia-dialhome/server"
 )
@@ -128,8 +132,8 @@ func TestGovernance_ARefusedToolDoesNotRun(t *testing.T) {
 	assert.Equal(t, "get_location", g.asked[0].Tool)
 	assert.Equal(t, "site-tools", g.asked[0].Registry)
 	assert.JSONEq(t, `{"accuracy":"high"}`, string(g.asked[0].Arguments))
-	time.Sleep(50 * time.Millisecond) // any record would be on the bus by now
-	assert.Empty(t, g.records(), "a refused call is the relay's to record")
+	assert.Never(t, func() bool { return len(g.records()) > 0 }, 200*time.Millisecond, 10*time.Millisecond,
+		"a refused call is the relay's to record")
 }
 
 func TestGovernance_NoDecisionMeansTheToolDoesNotRun(t *testing.T) {
@@ -161,7 +165,7 @@ func TestGovernance_AnAllowedToolRunsAndIsRecorded(t *testing.T) {
 }
 
 func TestGovernance_MemoryToolsReachTheSessionsMemory(t *testing.T) {
-	remember := calling("memory__remember", map[string]any{"content": "the engineer prefers metric units"})
+	remember := calling("memory__remember", map[string]any{"content": "the user prefers metric units"})
 
 	t.Run("a user the relay will keep memory for", func(t *testing.T) {
 		g := &governor{scope: dialhome.MemoryScope{Enabled: true, User: true, Tools: true}}
@@ -169,7 +173,7 @@ func TestGovernance_MemoryToolsReachTheSessionsMemory(t *testing.T) {
 		h := siteHandler(t, g, &ran, remember)
 		require.NoError(t, h.Converse(context.Background(), server.Turn{SessionID: "s1", Content: "remember"}, &collect{}))
 		require.Len(t, g.saved, 1)
-		assert.Equal(t, "the engineer prefers metric units", g.saved[0].Content)
+		assert.Equal(t, "the user prefers metric units", g.saved[0].Content)
 		assert.Empty(t, g.asked, "memory tools are not put to the tool policy")
 	})
 	t.Run("no user: no memory tools", func(t *testing.T) {
@@ -179,4 +183,150 @@ func TestGovernance_MemoryToolsReachTheSessionsMemory(t *testing.T) {
 		_ = h.Converse(context.Background(), server.Turn{SessionID: "s1", Content: "remember"}, &collect{})
 		assert.Empty(t, g.saved)
 	})
+}
+
+// capturing wraps the mock tool provider and keeps the messages of every
+// model call, so a test can read what the model was told.
+type capturing struct {
+	providers.ToolSupport
+	mu   sync.Mutex
+	seen [][]types.Message
+}
+
+func (c *capturing) keep(req providers.PredictionRequest) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.seen = append(c.seen, append([]types.Message(nil), req.Messages...))
+}
+
+func (c *capturing) PredictWithTools(ctx context.Context, req providers.PredictionRequest, tools providers.ProviderTools,
+	choice string) (providers.PredictionResponse, []types.MessageToolCall, error) {
+	c.keep(req)
+	return c.ToolSupport.PredictWithTools(ctx, req, tools, choice)
+}
+
+func (c *capturing) PredictStreamWithTools(ctx context.Context, req providers.PredictionRequest,
+	tools providers.ProviderTools, choice string) (<-chan providers.StreamChunk, error) {
+	c.keep(req)
+	return c.ToolSupport.PredictStreamWithTools(ctx, req, tools, choice)
+}
+
+// toolResults is every tool result the model was shown.
+func (c *capturing) toolResults() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []string
+	for _, msgs := range c.seen {
+		for i := range msgs {
+			if msgs[i].Role == "tool" {
+				out = append(out, msgs[i].GetContent())
+			}
+		}
+	}
+	return out
+}
+
+func TestGovernance_TheModelIsToldWhyACallWasRefused(t *testing.T) {
+	g := &governor{decision: dialhome.PolicyDecision{Reason: "Above the 25,000 limit: ask an approver."}}
+	var ran atomic.Int32
+	c := &capturing{ToolSupport: mock.NewToolProviderWithRepository("mock", "mock-model", false,
+		callScript{tool: "get_location"})}
+	h := siteHandler(t, g, &ran, func(context.Context) (providers.Provider, error) { return c, nil })
+	require.NoError(t, h.Converse(context.Background(), server.Turn{SessionID: "s1", Content: "where?"}, &collect{}))
+	assert.Zero(t, ran.Load())
+	results := c.toolResults()
+	require.NotEmpty(t, results, "the model saw the call's result")
+	assert.Contains(t, results[len(results)-1], "Above the 25,000 limit: ask an approver.")
+}
+
+// Over a real channel to a relay that does not decide tool calls, a local
+// tool does not run.
+func TestGovernance_ARelayThatDoesNotDecideRunsNoTools(t *testing.T) {
+	relay := relaytest.New(t, testKey, nil)
+	c, err := dialhome.Dial(context.Background(), dialhome.ClientConfig{
+		URL: relay.URL(), Key: testKey, Log: logr.Discard(),
+		MinBackoff: 20 * time.Millisecond, KeepAlive: relaytest.KeepAlive,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+	require.Eventually(t, c.Connected, 5*time.Second, 10*time.Millisecond)
+
+	var ran atomic.Int32
+	h := newHandler(t, promptkit.Config{
+		Provider: calling("get_location", nil), Policy: dialhome.NewGovernance(c),
+		Configure: func(conv *sdk.Conversation) error {
+			conv.OnTool("get_location", func(map[string]any) (any, error) { ran.Add(1); return "x", nil })
+			return nil
+		},
+	})
+	require.NoError(t, h.Converse(context.Background(), server.Turn{SessionID: "s1", Content: "where?"}, &collect{}))
+	assert.Zero(t, ran.Load())
+}
+
+// Only PromptKit's own four memory tools skip the policy, and only when the
+// relay keeps the memory: any other tool is asked about, whatever its name.
+func TestGovernance_AToolNamedLikeMemoryIsStillPutToThePolicy(t *testing.T) {
+	g := &governor{decision: dialhome.PolicyDecision{Allow: true},
+		scope: dialhome.MemoryScope{Enabled: true, User: true, Tools: true}}
+	var ran atomic.Int32
+	h := siteHandler(t, g, &ran, calling("memory__export", nil))
+	_ = h.Converse(context.Background(), server.Turn{SessionID: "s1", Content: "export"}, &collect{})
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	require.Len(t, g.asked, 1)
+	assert.Equal(t, "memory__export", g.asked[0].Tool)
+}
+
+// blockingRecorder holds every record until release closes.
+type blockingRecorder struct {
+	governor
+	release chan struct{}
+}
+
+func (b *blockingRecorder) RecordToolCall(ctx context.Context, r dialhome.ToolCallRecord) error {
+	<-b.release
+	return b.governor.RecordToolCall(ctx, r)
+}
+
+// A slow relay never holds the turn up, and its records still arrive, in
+// order, once it answers.
+func TestGovernance_ASlowRecorderNeitherHoldsTheTurnNorLosesRecords(t *testing.T) {
+	b := &blockingRecorder{governor: governor{decision: dialhome.PolicyDecision{Allow: true}}, release: make(chan struct{})}
+	var ran atomic.Int32
+	h := newHandler(t, promptkit.Config{
+		Provider: calling("get_location", nil), Policy: &b.governor, ToolCalls: b,
+		Configure: func(conv *sdk.Conversation) error {
+			conv.OnTool("get_location", func(map[string]any) (any, error) { ran.Add(1); return "x", nil })
+			return nil
+		},
+	})
+	done := make(chan error, 1)
+	go func() {
+		done <- h.Converse(context.Background(), server.Turn{SessionID: "s1", Content: "where?"}, &collect{})
+	}()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the turn waited on the recorder")
+	}
+	close(b.release)
+	require.Eventually(t, func() bool { return len(b.records()) == 2 }, 5*time.Second, 10*time.Millisecond)
+	assert.Equal(t, dialhome.ToolCallStarted, b.records()[0].Phase)
+}
+
+func TestGovernance_AToolThatFailsIsRecordedAsFailed(t *testing.T) {
+	g := &governor{decision: dialhome.PolicyDecision{Allow: true}}
+	h := newHandler(t, promptkit.Config{
+		Provider: calling("get_location", nil), Policy: g, ToolCalls: g,
+		Configure: func(conv *sdk.Conversation) error {
+			conv.OnTool("get_location", func(map[string]any) (any, error) { return nil, errors.New("sensor offline") })
+			return nil
+		},
+	})
+	require.NoError(t, h.Converse(context.Background(), server.Turn{SessionID: "s1", Content: "where?"}, &collect{}))
+	require.Eventually(t, func() bool { return len(g.records()) == 2 }, 5*time.Second, 10*time.Millisecond)
+	last := g.records()[1]
+	assert.Equal(t, dialhome.ToolCallFailed, last.Phase)
+	assert.Contains(t, last.Error, "sensor offline")
 }
