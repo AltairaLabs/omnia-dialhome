@@ -18,8 +18,11 @@
 //	                         under (or -policy-registry)
 //	OMNIA_DIALHOME_MEMORY    "true" gives conversations the session's memory
 //	                         (or -memory)
-//	OMNIA_DIALHOME_PORT      when set, serve /healthz and /readyz on it
-//	PORT                     the same, when OMNIA_DIALHOME_PORT is unset
+//	OMNIA_DIALHOME_PORT      when set, serve the platform probes on it: /healthz,
+//	                         /readyz, / (Vertex), /readiness (Foundry), /ping
+//	                         and /invocations (AgentCore); see probeHandler
+//	PORT                     the same, when OMNIA_DIALHOME_PORT is unset (Foundry
+//	                         sets it)
 //
 // When it is deployed by a PromptKit deploy adapter in place of the adapter's
 // own runtime, the adapter hands it the pack and the agent instead:
@@ -33,6 +36,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -164,7 +168,14 @@ func run(args []string, getenv func(string) string) int {
 	defer func() { _ = h.Close() }()
 
 	if opts.port != "" {
-		go serveProbes(ctx, net.JoinHostPort("", opts.port), ch, log)
+		// A port that cannot be bound is fatal: a platform probing it would
+		// otherwise restart the container in a loop with no clue why.
+		l, err := net.Listen("tcp", net.JoinHostPort("", opts.port))
+		if err != nil {
+			log.Error(err, "probe port not bound", "port", opts.port)
+			return exitServe
+		}
+		go serveProbes(ctx, l, ch, log)
 	}
 	go func() {
 		<-ctx.Done()
@@ -251,24 +262,72 @@ func defaultProvider(src *dialhome.ConfigSource, getenv func(string) string, log
 	}
 }
 
-// serveProbes answers /healthz while the process runs and /readyz while the
-// channel is connected, for platforms that probe a port.
-func serveProbes(ctx context.Context, addr string, ch *dialhome.Client, log logr.Logger) {
+// AgentCore's /ping statuses. HealthyBusy keeps the runtime session alive.
+const (
+	pingHealthy     = "Healthy"
+	pingHealthyBusy = "HealthyBusy"
+)
+
+// errInvokeHere is the answer to an invocation made to the container directly.
+const errInvokeHere = "this runtime is served over Omnia's dial-home channel and takes no invocations here: " +
+	"invoke the agent through Omnia"
+
+// probeHandler serves what the platforms that host the runtime probe on its
+// port. Every liveness check answers while the process runs, whether or not
+// the channel is connected: a platform that restarts an unhealthy container
+// would otherwise kill it while it re-dials an unreachable relay.
+//
+//   - GET /healthz: 200 while the process runs.
+//   - GET /readyz: 200 while the channel is connected, else 503.
+//   - GET /: 200 while the process runs (Vertex Agent Runtime's health check).
+//   - GET /readiness: 200 while the process runs (Azure AI Foundry hosted
+//     agents' readiness probe).
+//   - GET /ping: AgentCore's health check, always 200: {"status":"HealthyBusy"}
+//     while the channel is connected, which keeps the AgentCore session alive,
+//     and {"status":"Healthy"} while it is not.
+//   - POST /invocations: the invoke route of AgentCore and of Foundry's
+//     Invocations protocol, answered with 501 and a JSON error. Conversations
+//     arrive over the channel, not here.
+func probeHandler(connected func() bool) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		if ch.Connected() {
+	ok := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }
+	mux.HandleFunc("GET /healthz", ok)
+	mux.HandleFunc("GET /{$}", ok)
+	mux.HandleFunc("GET /readiness", ok)
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if connected() {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	mux.HandleFunc("GET /ping", func(w http.ResponseWriter, _ *http.Request) {
+		status := pingHealthy
+		if connected() {
+			status = pingHealthyBusy
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": status})
+	})
+	mux.HandleFunc("POST /invocations", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusNotImplemented, map[string]string{"status": "error", "error": errInvokeHere})
+	})
+	return mux
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// serveProbes serves probeHandler on l until ctx is done.
+func serveProbes(ctx context.Context, l net.Listener, ch *dialhome.Client, log logr.Logger) {
+	srv := &http.Server{Handler: probeHandler(ch.Connected), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
 		_ = srv.Close()
 	}()
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := srv.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Error(err, "probe server failed")
 	}
 }

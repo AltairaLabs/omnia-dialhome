@@ -5,7 +5,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -116,6 +121,109 @@ func TestDefaultProvider(t *testing.T) {
 		Spec: dialhome.ProviderSpec{Type: "mock", Defaults: &dialhome.ProviderDefaults{RequestTimeout: "soon"}}}}}
 	_, err = defaultProvider(dialhome.NewConfigSource(ch, bad), env(nil), log)(context.Background())
 	assert.Error(t, err)
+}
+
+func probe(t *testing.T, h http.Handler, method, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(method, path, strings.NewReader(`{"prompt":"hi"}`)))
+	return rec
+}
+
+// Every platform's liveness check passes while the process runs, connected
+// or not: a platform that restarts an unhealthy container must not kill one
+// that is re-dialling an unreachable relay.
+func TestProbeHandler_LiveWhetherOrNotConnected(t *testing.T) {
+	for _, connected := range []bool{false, true} {
+		h := probeHandler(func() bool { return connected })
+		for _, path := range []string{"/healthz", "/", "/readiness", "/ping"} {
+			assert.Equal(t, http.StatusOK, probe(t, h, http.MethodGet, path).Code, "GET %s, connected=%v", path, connected)
+		}
+	}
+}
+
+func TestProbeHandler_Readyz(t *testing.T) {
+	assert.Equal(t, http.StatusServiceUnavailable,
+		probe(t, probeHandler(func() bool { return false }), http.MethodGet, "/readyz").Code)
+	assert.Equal(t, http.StatusOK, probe(t, probeHandler(func() bool { return true }), http.MethodGet, "/readyz").Code)
+}
+
+// AgentCore's /ping: Healthy while dialling, HealthyBusy while connected, so
+// the session is kept alive while it carries conversations.
+func TestProbeHandler_AgentCorePing(t *testing.T) {
+	for connected, want := range map[bool]string{false: "Healthy", true: "HealthyBusy"} {
+		rec := probe(t, probeHandler(func() bool { return connected }), http.MethodGet, "/ping")
+		require.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+		var body map[string]any
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+		assert.Equal(t, map[string]any{"status": want}, body, "connected=%v; no time_of_last_update", connected)
+	}
+}
+
+func TestProbeHandler_InvocationsRefused(t *testing.T) {
+	rec := probe(t, probeHandler(func() bool { return true }), http.MethodPost, "/invocations")
+	assert.Equal(t, http.StatusNotImplemented, rec.Code)
+	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	var body map[string]string
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	assert.Equal(t, "error", body["status"])
+	assert.Contains(t, body["error"], "dial-home")
+	assert.Contains(t, body["error"], "through Omnia")
+}
+
+func TestProbeHandler_UnknownRoutes(t *testing.T) {
+	h := probeHandler(func() bool { return true })
+	assert.Equal(t, http.StatusNotFound, probe(t, h, http.MethodGet, "/nope").Code)
+	assert.Equal(t, http.StatusMethodNotAllowed, probe(t, h, http.MethodGet, "/invocations").Code)
+	assert.Equal(t, http.StatusMethodNotAllowed, probe(t, h, http.MethodPost, "/ping").Code)
+}
+
+// serveProbes answers on the real port and stops with its context.
+func TestServeProbes(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := l.Addr().String()
+
+	ch, err := dialhome.Dial(context.Background(), dialhome.ClientConfig{
+		URL: "ws://127.0.0.1:1/v1/channel", Key: "k", MinBackoff: time.Hour, Log: logr.Discard()})
+	require.NoError(t, err)
+	defer func() { _ = ch.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { serveProbes(ctx, l, ch, logr.Discard()); close(done) }()
+
+	resp, err := http.Get("http://" + addr + "/ping") //nolint:noctx // test
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	var body map[string]string
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	assert.Equal(t, "Healthy", body["status"], "the relay is unreachable")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveProbes did not stop with its context")
+	}
+}
+
+// A probe port that cannot be bound stops the process, rather than leaving it
+// up for a platform to fail every probe against.
+func TestRun_ProbePortNotBound(t *testing.T) {
+	l, err := net.Listen("tcp", ":0")
+	require.NoError(t, err)
+	defer func() { _ = l.Close() }()
+	_, port, err := net.SplitHostPort(l.Addr().String())
+	require.NoError(t, err)
+
+	assert.Equal(t, exitServe, run(nil, env(map[string]string{
+		"OMNIA_DIALHOME_PACK": "a.pack.json", "OMNIA_DIALHOME_PROMPT": "chat",
+		"OMNIA_DIAL_HOME_URL": "ws://127.0.0.1:1/v1/channel", "OMNIA_DIAL_HOME_KEY": "k",
+		"OMNIA_DIALHOME_PORT": port,
+	})))
 }
 
 func TestParse_Governance(t *testing.T) {

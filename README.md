@@ -40,7 +40,7 @@ docker run --rm \
   -e OMNIA_DIALHOME_PROMPT=assistant \
   -e OMNIA_DIAL_HOME_URL=wss://my-agent-dial-home.example.com/v1/channel \
   -e OMNIA_DIAL_HOME_KEY="$KEY" \
-  ghcr.io/altairalabs/omnia-dialhome:v0.2.0
+  ghcr.io/altairalabs/omnia-dialhome:v0.2.1
 ```
 
 | Variable | Flag | Meaning |
@@ -53,8 +53,49 @@ docker run --rm \
 | `OMNIA_DIALHOME_CLIENT_TOOLS` | `-client-tools` | Comma-separated pack tools the caller's client runs |
 | `OMNIA_DIALHOME_POLICY_REGISTRY` | `-policy-registry` | The name this runtime's tools are governed under: Omnia's tool policies select them by it |
 | `OMNIA_DIALHOME_MEMORY` | `-memory` | `true` gives conversations the memory Omnia keeps for the session's user |
-| `OMNIA_DIALHOME_PORT` | | When set, serves `/healthz` (process up) and `/readyz` (channel connected) on this port |
-| `PORT` | | The same, when `OMNIA_DIALHOME_PORT` is not set |
+| `OMNIA_DIALHOME_PORT` | | When set, serves the [platform probes](#platform-probes) on this port |
+| `PORT` | | The same, when `OMNIA_DIALHOME_PORT` is not set. Azure AI Foundry sets it |
+
+### Platform probes
+
+With a port set, the container answers what the platforms that host it probe.
+Every liveness check passes while the process runs, **whether or not the
+channel is connected**: a platform that restarts an unhealthy container would
+otherwise kill it while it re-dials a relay it cannot yet reach, and it would
+never get the chance to connect.
+
+| Route | Answer | For |
+|---|---|---|
+| `GET /healthz` | `200` while the process runs | Kubernetes-style liveness |
+| `GET /readyz` | `200` while the channel is connected, else `503` | Readiness, where a platform should route nothing to a runtime that cannot serve |
+| `GET /` | `200` while the process runs | Vertex Agent Runtime's health check |
+| `GET /readiness` | `200` while the process runs | Azure AI Foundry hosted agents' readiness probe |
+| `GET /ping` | `200`, `{"status":"HealthyBusy"}` while the channel is connected, else `{"status":"Healthy"}` | AWS Bedrock AgentCore's health check |
+| `POST /invocations` | `501`, `{"status":"error","error":"…invoke the agent through Omnia"}` | AgentCore's invoke route, and Foundry's Invocations protocol |
+
+Conversations reach the runtime over the channel, never through the platform's
+own invoke API, so `/invocations` answers with an error rather than serving a
+second path. On AgentCore, `InvokeAgentRuntime` therefore returns
+`424 RuntimeClientError`; that is expected.
+
+- **AgentCore.** Serve the default port: set `OMNIA_DIALHOME_PORT=8080`, and
+  leave `protocolConfiguration.path` at `/invocations`. AgentCore starts a
+  container for a runtime session, which an `InvokeAgentRuntime` call opens,
+  so something must make one invocation to start it; that call returns the
+  `424` above while the container starts and dials home. `HealthyBusy` marks
+  the session active, so AgentCore keeps a connected runtime up past its idle
+  timeout, to the session's maximum lifetime, although no further invocation
+  reaches it. The session is billed for that time. The response omits the
+  optional `time_of_last_update`.
+- **Vertex Agent Runtime.** Set `OMNIA_DIALHOME_PORT=8080`. Do not point a
+  health check at `/readyz`: while the relay is unreachable it answers `503`,
+  and a runtime that is reported unhealthy for that is never left up long
+  enough to connect. `/readyz` does suit the optional keep-alive probe
+  (`keep_alive_probe.http_get.path: /readyz`), whose `2xx` means busy: an idle
+  instance whose channel is connected is then not scaled down, up to the
+  probe's `max_seconds` after the last request.
+- **Azure AI Foundry.** Foundry passes `PORT` and probes `/readiness`, so no
+  port setting is needed. `OMNIA_DIALHOME_PORT`, when set, takes precedence.
 
 ### Deployed by PromptArena
 
