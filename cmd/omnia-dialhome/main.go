@@ -14,6 +14,10 @@
 //	OMNIA_DIALHOME_PACK      the compiled .pack.json (or -pack)
 //	OMNIA_DIALHOME_PROMPT    the pack prompt to run (or -prompt)
 //	OMNIA_DIALHOME_CLIENT_TOOLS  comma-separated client tools (or -client-tools)
+//	OMNIA_DIALHOME_POLICY_REGISTRY  the name this runtime's tools are governed
+//	                         under (or -policy-registry)
+//	OMNIA_DIALHOME_MEMORY    "true" gives conversations the session's memory
+//	                         (or -memory)
 //	OMNIA_DIALHOME_PORT      when set, serve /healthz and /readyz on it
 //	PORT                     the same, when OMNIA_DIALHOME_PORT is unset
 //
@@ -78,6 +82,10 @@ type options struct {
 	packJSON    string
 	clientTools []string
 	port        string
+	// registry is the name the pack's tools are governed under.
+	registry string
+	// memory gives conversations the session's memory, through the relay.
+	memory bool
 }
 
 func parse(args []string, getenv func(string) string) (options, error) {
@@ -85,10 +93,14 @@ func parse(args []string, getenv func(string) string) (options, error) {
 	pack := fs.String("pack", getenv("OMNIA_DIALHOME_PACK"), "compiled PromptPack (.pack.json)")
 	prompt := fs.String("prompt", firstSet(getenv, "OMNIA_DIALHOME_PROMPT", envHandoffAgent), "pack prompt to run")
 	tools := fs.String("client-tools", getenv("OMNIA_DIALHOME_CLIENT_TOOLS"), "comma-separated client tools")
+	registry := fs.String("policy-registry", getenv("OMNIA_DIALHOME_POLICY_REGISTRY"),
+		"the name the pack's tools are governed under")
+	memory := fs.Bool("memory", getenv("OMNIA_DIALHOME_MEMORY") == "true", "give conversations the session's memory")
 	if err := fs.Parse(args); err != nil {
 		return options{}, err
 	}
-	o := options{pack: *pack, prompt: *prompt, port: firstSet(getenv, "OMNIA_DIALHOME_PORT", "PORT")}
+	o := options{pack: *pack, prompt: *prompt, port: firstSet(getenv, "OMNIA_DIALHOME_PORT", "PORT"),
+		registry: *registry, memory: *memory}
 	if o.pack == "" {
 		if getenv(envHandoffPackJSON) == "" && getenv(envHandoffPackURI) != "" {
 			return options{}, fmt.Errorf("the deploy staged the pack at %s=%s, which is not supported: "+
@@ -144,11 +156,7 @@ func run(args []string, getenv func(string) string) int {
 	}
 	defer func() { _ = ch.Close() }()
 
-	h, err := promptkit.New(promptkit.Config{
-		PackPath: opts.pack, PromptName: opts.prompt, ClientTools: opts.clientTools,
-		Provider: defaultProvider(dialhome.NewConfigSource(ch, baked), getenv, log),
-		Log:      log,
-	})
+	h, err := promptkit.New(handlerConfig(opts, ch, dialhome.NewConfigSource(ch, baked), getenv, log))
 	if err != nil {
 		log.Error(err, "runtime not built")
 		return exitConfig
@@ -168,6 +176,28 @@ func run(args []string, getenv func(string) string) int {
 		return exitServe
 	}
 	return exitOK
+}
+
+// handlerConfig is the pack served over ch: every tool the pack runs here is
+// put to Omnia's tool policy and recorded on its session, and with -memory
+// its conversations get the session's memory.
+func handlerConfig(
+	opts options, ch dialhome.StreamOpener, src *dialhome.ConfigSource, getenv func(string) string, log logr.Logger,
+) promptkit.Config {
+	gov := dialhome.NewGovernance(ch)
+	cfg := promptkit.Config{
+		PackPath: opts.pack, PromptName: opts.prompt, ClientTools: opts.clientTools,
+		Provider:  defaultProvider(src, getenv, log),
+		Policy:    gov,
+		ToolCalls: gov,
+		Log:       log,
+
+		PolicyRegistry: opts.registry,
+	}
+	if opts.memory {
+		cfg.Memory = gov
+	}
+	return cfg
 }
 
 // firstSet returns the value of the first of names that is set.

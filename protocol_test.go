@@ -37,15 +37,24 @@ func TestStreamKindString(t *testing.T) {
 	require.Equal(t, "memory", KindMemory.String())
 	require.Equal(t, "events", KindEvents.String())
 	require.Equal(t, "config", KindConfig.String())
-	require.Equal(t, "unknown(7)", StreamKind(7).String())
+	require.Equal(t, "policy", KindPolicy.String())
+	require.Equal(t, "tool-calls", KindToolCalls.String())
+	require.Equal(t, "memory-store", KindMemoryStore.String())
+	require.Equal(t, "unknown(8)", StreamKind(8).String())
 }
 
 // The wire bytes are the contract with every relay already deployed.
 func TestStreamKinds_AreTheWireBytes(t *testing.T) {
-	require.Equal(t, []byte{1, 2, 3, 4},
-		[]byte{byte(KindRuntime), byte(KindMemory), byte(KindEvents), byte(KindConfig)})
+	require.Equal(t, []byte{1, 2, 3, 4, 5, 6, 7},
+		[]byte{byte(KindRuntime), byte(KindMemory), byte(KindEvents), byte(KindConfig),
+			byte(KindPolicy), byte(KindToolCalls), byte(KindMemoryStore)})
 	require.Equal(t, "/v1/channel", ChannelPath)
 	require.Equal(t, "/v1/config", ConfigPath)
+	require.Equal(t, "/v1/policy/decision", PolicyDecisionPath)
+	require.Equal(t, "/v1/tool-calls", ToolCallsPath)
+	for _, p := range []string{MemoryScopePath, MemoryRememberPath, MemoryRecallPath, MemoryListPath, MemoryForgetPath} {
+		require.Regexp(t, `^/v1/memory/[a-z]+$`, p)
+	}
 	require.Equal(t, "X-Omnia-Dial-Home-Version", HeaderVersion)
 	require.Equal(t, "1", ProtocolVersion)
 }

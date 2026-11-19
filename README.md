@@ -14,7 +14,7 @@ This module contains:
 
 | Package | What it is |
 |---|---|
-| `dialhome` (module root) | The channel client: dial out, handshake, keepalive, re-dial; the stream kinds; provider configuration served over the channel (`RemoteConfig`, `ConfigSource`) |
+| `dialhome` (module root) | The channel client: dial out, handshake, keepalive, re-dial; the stream kinds; provider configuration served over the channel (`RemoteConfig`, `ConfigSource`); policy decisions, tool call records and memory (`Governance`) |
 | `runtimev1` | The `omnia.runtime.v1` gRPC contract the channel carries, generated from `proto/omnia/runtime/v1/runtime.proto` |
 | `server` | Serves `omnia.runtime.v1` for any `Handler`: hello first, streamed chunks, client tool round-trips, heartbeats, Health |
 | `promptkit` | A `Handler` backed by a [PromptKit](https://github.com/AltairaLabs/PromptKit) pack: one SDK conversation per Omnia session |
@@ -40,7 +40,7 @@ docker run --rm \
   -e OMNIA_DIALHOME_PROMPT=assistant \
   -e OMNIA_DIAL_HOME_URL=wss://my-agent-dial-home.example.com/v1/channel \
   -e OMNIA_DIAL_HOME_KEY="$KEY" \
-  ghcr.io/altairalabs/omnia-dialhome:v0.1.1
+  ghcr.io/altairalabs/omnia-dialhome:v0.2.0
 ```
 
 | Variable | Flag | Meaning |
@@ -51,6 +51,8 @@ docker run --rm \
 | `OMNIA_DIALHOME_PACK` | `-pack` | The compiled `.pack.json`. Required, unless a deploy hands the pack over (below) |
 | `OMNIA_DIALHOME_PROMPT` | `-prompt` | The pack prompt to run. Required, unless a deploy hands the agent over (below) |
 | `OMNIA_DIALHOME_CLIENT_TOOLS` | `-client-tools` | Comma-separated pack tools the caller's client runs |
+| `OMNIA_DIALHOME_POLICY_REGISTRY` | `-policy-registry` | The name this runtime's tools are governed under: Omnia's tool policies select them by it |
+| `OMNIA_DIALHOME_MEMORY` | `-memory` | `true` gives conversations the memory Omnia keeps for the session's user |
 | `OMNIA_DIALHOME_PORT` | | When set, serves `/healthz` (process up) and `/readyz` (channel connected) on this port |
 | `PORT` | | The same, when `OMNIA_DIALHOME_PORT` is not set |
 
@@ -110,16 +112,59 @@ h, _ := promptkit.New(promptkit.Config{
 	PromptName:  "assistant",
 	ClientTools: []string{"get_location"},
 	Configure: func(conv *sdk.Conversation) error {
-		conv.OnTool("read_scada", readSCADA) // runs here, on site
+		conv.OnTool("read_sensor", readSensor) // runs here, on site
 		return nil
 	},
 })
 log.Fatal(server.Serve(ch, h))
 ```
 
-A pack tool with an `OnTool` handler runs in this process and never crosses
-the channel. A tool listed in `ClientTools` is sent to the caller's client as
-a client tool call and its answer goes back to the model.
+A pack tool with an `OnTool` handler runs in this process. A tool listed in
+`ClientTools` is sent to the caller's client as a client tool call and its
+answer goes back to the model.
+
+### Governed like an agent in the cluster
+
+Give the handler the channel's `Governance` and the tools that run here are
+governed by Omnia, the way its own runtime governs the tools it runs:
+
+```go
+gov := dialhome.NewGovernance(ch)
+h, _ := promptkit.New(promptkit.Config{
+	PackPath:       "agent.pack.json",
+	PromptName:     "assistant",
+	Policy:         gov,          // ask before every tool runs here
+	PolicyRegistry: "local-tools", // the name Omnia's policies select these tools by
+	ToolCalls:      gov,          // record each call on the session
+	Memory:         gov,          // the session user's memory, as Omnia scopes it
+	Configure: func(conv *sdk.Conversation) error {
+		conv.OnTool("open_ticket", openTicket)
+		return nil
+	},
+})
+```
+
+- **Policy.** Before each tool the pack runs here, the handler asks Omnia
+  whether it may, and runs it only on an allow. A refusal goes back to the
+  model as the tool's error, carrying the policy's message, so the agent can
+  tell the person why. No answer is a refusal too: with the channel down, a
+  timeout, or a relay that cannot decide, the tool does not run. Client tools
+  are not put to it, nor, when `Memory` is set, the four memory tools.
+
+  **Upgrading from v0.1.** A relay that predates policy decisions gives none,
+  so from v0.2.0 every tool the pack runs in this process is refused until the
+  relay is upgraded too. Client tools are unaffected.
+- **Tool calls.** Each call the pack ran here is recorded on its session:
+  arguments when it starts, then its result or its error. A call Omnia
+  refused is recorded by Omnia.
+- **Memory.** Conversations get the memory Omnia keeps for the session's user:
+  the memory tools, and recall into each turn, as the agent is configured.
+  Who the user is, and what they consented to, is Omnia's to decide from the
+  session; nothing the runtime sends can name another user. A caller Omnia
+  keeps no user memory for gets no memory tools.
+
+Every request names only its session. Omnia answers from the identity it
+carried for that session, never from anything the runtime says about it.
 
 `ch.ForwardLocal(dialhome.KindEvents)` and `ch.ForwardLocal(dialhome.KindMemory)`
 give a loopback URL whose requests ride the channel to the agent's session and
@@ -142,6 +187,12 @@ memory services in the cluster, for an HTTP client that should reach them.
   | memory | 2 | runtime | HTTP/1.1 to the agent's memory service |
   | events | 3 | runtime | HTTP/1.1 to the agent's session service |
   | config | 4 | runtime | HTTP/1.1 `GET /v1/config`: the agent's provider configuration |
+  | policy | 5 | runtime | HTTP/1.1 `POST /v1/policy/decision`: may this tool call run? |
+  | tool-calls | 6 | runtime | HTTP/1.1 `POST /v1/tool-calls`: a tool call the runtime ran |
+  | memory-store | 7 | runtime | HTTP/1.1 `POST /v1/memory/{scope,remember,recall,list,forget}`: the session's memory |
+
+  Kinds 4 to 7 were added within version 1. A relay that does not serve one
+  closes its streams, and the runtime fails closed: no decision, no tool.
 
 - **Liveness.** yamux keepalives. A dropped session is re-dialled with a
   capped, jittered exponential backoff (1s to 30s).

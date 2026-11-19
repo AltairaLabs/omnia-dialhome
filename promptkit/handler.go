@@ -56,6 +56,28 @@ type Config struct {
 	// IdleTTL bounds how long an unused conversation is kept;
 	// DefaultIdleTTL when zero.
 	IdleTTL time.Duration
+	// Policy, when set, decides every tool the pack runs in this process
+	// before it runs, and the tool runs only on an allow: a refusal, or no
+	// answer at all, reaches the model as the tool's error. Client tools are
+	// not put to it, nor, when Memory is set, PromptKit's four memory tools.
+	// Over dial-home, pass the channel's *dialhome.Governance.
+	//
+	// It is a PromptKit tool hook, so it covers the tool calls of a turn this
+	// handler runs. PromptKit runs no hooks for a duplex session's tools or a
+	// workflow's composed tool steps; this handler serves neither.
+	Policy Decider
+	// PolicyRegistry is the name this runtime's tools are governed under: a
+	// tool policy selects them by it (PolicyRequest.Registry).
+	PolicyRegistry string
+	// ToolCalls, when set, records each tool the pack runs in this process on
+	// its session: started, then completed or failed.
+	ToolCalls Recorder
+	// Memory, when set, gives each conversation the memory its session has,
+	// as the service scopes it. The scope is read once, when the conversation
+	// opens; the service checks every request again. A conversation whose
+	// scope cannot be read opens without memory. Do not also pass
+	// sdk.WithMemory in Options: the conversation would get two memories.
+	Memory MemoryService
 	// Log receives conversation lifecycle events. Zero value discards.
 	Log logr.Logger
 }
@@ -407,6 +429,7 @@ func (h *Handler) takeIdle() map[string]*session {
 func (h *Handler) open(ctx context.Context, id string) (*session, error) {
 	s := newSession(h.now())
 	opts := append([]sdk.Option{sdk.WithConversationID(id)}, h.cfg.Options...)
+	opts = append(opts, h.governanceOptions(ctx, id)...)
 	if h.cfg.Provider != nil {
 		// Not the stream's ctx: the provider lives with the conversation, and
 		// a credential source may keep its ctx to refresh tokens with.
@@ -427,6 +450,9 @@ func (h *Handler) open(ctx context.Context, id string) (*session, error) {
 	s.conv = conv
 	for _, name := range h.cfg.ClientTools {
 		conv.OnClientTool(name, s.clientTool)
+	}
+	if h.cfg.ToolCalls != nil {
+		recordToolCalls(conv, id, h.cfg.ToolCalls, h.clientTools(), h.cfg.Log)
 	}
 	if h.cfg.Configure != nil {
 		if err := h.cfg.Configure(conv); err != nil {
