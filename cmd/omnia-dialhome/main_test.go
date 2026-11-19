@@ -117,3 +117,38 @@ func TestDefaultProvider(t *testing.T) {
 	_, err = defaultProvider(dialhome.NewConfigSource(ch, bad), env(nil), log)(context.Background())
 	assert.Error(t, err)
 }
+
+func TestParse_Governance(t *testing.T) {
+	o, err := parse(nil, env(map[string]string{
+		"OMNIA_DIALHOME_PACK": "a.pack.json", "OMNIA_DIALHOME_PROMPT": "chat",
+		"OMNIA_DIALHOME_POLICY_REGISTRY": "site-tools", "OMNIA_DIALHOME_MEMORY": "true",
+	}))
+	require.NoError(t, err)
+	assert.Equal(t, "site-tools", o.registry)
+	assert.True(t, o.memory)
+
+	o, err = parse([]string{"-pack", "p", "-prompt", "q", "-policy-registry", "r"}, env(nil))
+	require.NoError(t, err)
+	assert.Equal(t, "r", o.registry)
+	assert.False(t, o.memory, "memory is opt-in")
+}
+
+// Every tool the pack runs here is put to the policy and recorded; memory
+// only when asked for.
+func TestHandlerConfig_GovernsEveryConversation(t *testing.T) {
+	c, err := dialhome.Dial(context.Background(), dialhome.ClientConfig{
+		URL: "ws://127.0.0.1:1/v1/channel", Key: "k", Log: logr.Discard(),
+	})
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+	src := dialhome.NewConfigSource(c, nil)
+
+	cfg := handlerConfig(options{pack: "p", prompt: "q", registry: "site-tools"}, c, src, env(nil), logr.Discard())
+	assert.NotNil(t, cfg.Policy)
+	assert.NotNil(t, cfg.ToolCalls)
+	assert.Nil(t, cfg.Memory)
+	assert.Equal(t, "site-tools", cfg.PolicyRegistry)
+
+	cfg = handlerConfig(options{pack: "p", prompt: "q", memory: true}, c, src, env(nil), logr.Discard())
+	assert.NotNil(t, cfg.Memory)
+}

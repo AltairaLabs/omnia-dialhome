@@ -60,6 +60,17 @@ const (
 	// predates it closes the stream, as the contract requires for any kind it
 	// does not serve, and the runtime keeps its baked config.
 	KindConfig StreamKind = 4
+	// KindPolicy (runtime → relay, HTTP) decides one tool call the runtime is
+	// about to run itself, at PolicyDecisionPath. Fail closed: a relay that
+	// predates it closes the stream, and a tool with no decision does not run.
+	KindPolicy StreamKind = 5
+	// KindToolCalls (runtime → relay, HTTP) records a tool call the runtime
+	// ran itself on the session it belongs to, at ToolCallsPath.
+	KindToolCalls StreamKind = 6
+	// KindMemoryStore (runtime → relay, HTTP) is the session's memory: the
+	// Memory*Path operations, scoped by the relay to the session's user, not
+	// by the runtime. KindMemory is the raw HTTP forward and stays as it was.
+	KindMemoryStore StreamKind = 7
 )
 
 func (k StreamKind) String() string {
@@ -72,6 +83,12 @@ func (k StreamKind) String() string {
 		return "events"
 	case KindConfig:
 		return "config"
+	case KindPolicy:
+		return "policy"
+	case KindToolCalls:
+		return "tool-calls"
+	case KindMemoryStore:
+		return "memory-store"
 	default:
 		return fmt.Sprintf("unknown(%d)", byte(k))
 	}

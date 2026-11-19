@@ -16,6 +16,12 @@
 //	runtime → relay    KindEvents    HTTP/1.1 to the agent's session-api
 //	runtime → relay    KindConfig    HTTP/1.1, GET ConfigPath: the agent's
 //	                                 resolved provider config (RemoteConfig)
+//	runtime → relay    KindPolicy    HTTP/1.1, POST PolicyDecisionPath: may this
+//	                                 tool call run?
+//	runtime → relay    KindToolCalls HTTP/1.1, POST ToolCallsPath: a tool call
+//	                                 the runtime ran, for its session
+//	runtime → relay    KindMemoryStore HTTP/1.1, POST Memory*Path: the
+//	                                 session's memory, scoped by the relay
 //
 // # Wire contract, version 1
 //
@@ -37,7 +43,20 @@
 //
 // KindConfig was added after version 1 shipped, without a version bump: the
 // rule above already makes a relay that predates it close the stream, and the
-// runtime then keeps its baked configuration.
+// runtime then keeps its baked configuration. The governance kinds were added
+// the same way, and fail closed against such a relay: a tool with no policy
+// decision does not run, a conversation whose memory scope cannot be read
+// has no memory, and a tool call that cannot be recorded is logged.
+//
+// # Governance over the channel
+//
+// A runtime that runs tools itself (a site agent's plant reads and work
+// orders) asks the relay before each one (Governance.Decide) and runs it only
+// on an allow; no answer, for any reason, is a refusal. It records each call
+// it ran (Governance.RecordToolCall); a call the relay refused, the relay
+// records itself. Memory is the relay's to scope: every request names only
+// the session, and the relay answers from the identity it carried for it.
+// Package promptkit wires all three into a PromptKit pack.
 //
 // # Configuration over the channel
 //
