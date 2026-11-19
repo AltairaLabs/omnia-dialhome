@@ -168,7 +168,14 @@ func run(args []string, getenv func(string) string) int {
 	defer func() { _ = h.Close() }()
 
 	if opts.port != "" {
-		go serveProbes(ctx, net.JoinHostPort("", opts.port), ch, log)
+		// A port that cannot be bound is fatal: a platform probing it would
+		// otherwise restart the container in a loop with no clue why.
+		l, err := net.Listen("tcp", net.JoinHostPort("", opts.port))
+		if err != nil {
+			log.Error(err, "probe port not bound", "port", opts.port)
+			return exitServe
+		}
+		go serveProbes(ctx, l, ch, log)
 	}
 	go func() {
 		<-ctx.Done()
@@ -313,14 +320,14 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// serveProbes serves probeHandler on addr until ctx is done.
-func serveProbes(ctx context.Context, addr string, ch *dialhome.Client, log logr.Logger) {
-	srv := &http.Server{Addr: addr, Handler: probeHandler(ch.Connected), ReadHeaderTimeout: 5 * time.Second}
+// serveProbes serves probeHandler on l until ctx is done.
+func serveProbes(ctx context.Context, l net.Listener, ch *dialhome.Client, log logr.Logger) {
+	srv := &http.Server{Handler: probeHandler(ch.Connected), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
 		_ = srv.Close()
 	}()
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := srv.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Error(err, "probe server failed")
 	}
 }

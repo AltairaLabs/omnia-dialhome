@@ -79,11 +79,14 @@ second path. On AgentCore, `InvokeAgentRuntime` therefore returns
 `424 RuntimeClientError`; that is expected.
 
 - **AgentCore.** Serve the default port: set `OMNIA_DIALHOME_PORT=8080`, and
-  leave `protocolConfiguration.path` at `/invocations`. `HealthyBusy` marks the
-  session active, so AgentCore keeps a connected runtime up past its idle
-  timeout (to the session's maximum lifetime) although no invocation reaches
-  it. The response carries no `time_of_last_update`; AgentCore tracks status
-  changes itself.
+  leave `protocolConfiguration.path` at `/invocations`. AgentCore starts a
+  container for a runtime session, which an `InvokeAgentRuntime` call opens,
+  so something must make one invocation to start it; that call returns the
+  `424` above while the container starts and dials home. `HealthyBusy` marks
+  the session active, so AgentCore keeps a connected runtime up past its idle
+  timeout, to the session's maximum lifetime, although no further invocation
+  reaches it. The session is billed for that time. The response omits the
+  optional `time_of_last_update`.
 - **Vertex Agent Runtime.** Set `OMNIA_DIALHOME_PORT=8080`. Do not point a
   health check at `/readyz`: while the relay is unreachable it answers `503`,
   and a runtime that is reported unhealthy for that is never left up long
