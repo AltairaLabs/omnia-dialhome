@@ -228,6 +228,9 @@ func frontDoor(h server.Handler, ch dialhome.StreamOpener, getenv func(string) s
 		Handler: h, Relay: dialhome.NewGovernance(ch), Platform: getenv("OMNIA_DIALHOME_PLATFORM"),
 		SessionFallback: getenv("FOUNDRY_AGENT_SESSION_ID"), Log: log.WithName("front-door"),
 	}
+	if c, ok := ch.(interface{ Connected() bool }); ok {
+		fd.Connected = c.Connected
+	}
 	if fd.Platform == "" && getenv("FOUNDRY_PROJECT_ENDPOINT") != "" {
 		fd.Platform = frontdoor.PlatformFoundry
 	}

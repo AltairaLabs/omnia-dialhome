@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -351,4 +352,25 @@ func TestFrontDoorOverTheChannel(t *testing.T) {
 func TestFrontDoorEndPath(t *testing.T) {
 	assert.Equal(t, "/v1/front-door/turns/a%2Fb/end", dialhome.FrontDoorEndPath("a/b"))
 	assert.Equal(t, "front-door", dialhome.KindFrontDoor.String())
+}
+
+// A turn waits for the channel to come up, and is refused when it does not.
+func TestWaitsForTheChannel(t *testing.T) {
+	_, _, relay, _ := newServer(t, "")
+	var up atomic.Bool
+	fd := &frontdoor.Server{Handler: &echo{}, Relay: relay, Connected: up.Load, ConnectWait: 2 * time.Second}
+	mux := http.NewServeMux()
+	fd.Register(mux)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		up.Store(true)
+	}()
+	assert.Equal(t, http.StatusOK, do(mux, http.MethodPost, "/invocations", `{"prompt":"x"}`, nil).Code)
+
+	down := &frontdoor.Server{Handler: &echo{}, Relay: relay, Connected: func() bool { return false },
+		ConnectWait: 50 * time.Millisecond}
+	mux = http.NewServeMux()
+	down.Register(mux)
+	assert.Equal(t, http.StatusServiceUnavailable, do(mux, http.MethodPost, "/invocations", `{"prompt":"x"}`, nil).Code)
+	assert.Len(t, relay.begins, 1, "nothing opened while the channel was down")
 }

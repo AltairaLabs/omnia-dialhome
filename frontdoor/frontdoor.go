@@ -29,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/go-logr/logr"
 
@@ -64,6 +65,12 @@ const KickField = "omnia_dial_home"
 // maxBody bounds a request body.
 const maxBody = 4 << 20
 
+// DefaultConnectWait is how long a turn waits for the channel to come up.
+const DefaultConnectWait = 30 * time.Second
+
+// connectPoll is how often that wait checks.
+const connectPoll = 50 * time.Millisecond
+
 // TurnOpener is the relay side of a front-door turn. *dialhome.Governance is
 // one.
 type TurnOpener interface {
@@ -83,7 +90,14 @@ type Server struct {
 	// SessionFallback is the platform session when a request names none
 	// (Foundry's FOUNDRY_AGENT_SESSION_ID: one container per session).
 	SessionFallback string
-	Log             logr.Logger
+	// Connected reports whether the channel is up. When set, a turn waits up
+	// to ConnectWait for it before opening: a platform that starts a
+	// container per session sends the session's first invocation before the
+	// container has dialled home.
+	Connected func() bool
+	// ConnectWait bounds that wait; DefaultConnectWait when zero.
+	ConnectWait time.Duration
+	Log         logr.Logger
 
 	inflight atomic.Int64
 	kicked   atomic.Bool
@@ -138,12 +152,20 @@ func (s *Server) run(ctx context.Context, t turn, chunk func(string)) (result, e
 	}
 	s.inflight.Add(1)
 	defer s.inflight.Add(-1)
+	if !s.waitConnected(ctx) {
+		s.Log.Info("front-door turn not opened", "reason", "channel not connected", "platform", t.platform)
+		return result{}, &errTurn{status: http.StatusServiceUnavailable, msg: "the agent cannot take a turn right now"}
+	}
 	begin, err := s.Relay.BeginFrontDoorTurn(ctx, dialhome.FrontDoorBeginRequest{
 		Platform: t.platform, PlatformSessionID: t.session, IdentityToken: t.token,
 		Message: dialhome.FrontDoorMessage{Text: t.text},
 	})
 	if err != nil {
-		return result{}, refusal(err)
+		r := refusal(err)
+		var e *errTurn
+		_ = errors.As(r, &e)
+		s.Log.Info("front-door turn not opened", "status", e.status, "reason", err.Error(), "platform", t.platform)
+		return result{}, r
 	}
 	em := &collector{chunk: chunk}
 	turnErr := s.Handler.Converse(ctx, server.Turn{
@@ -169,6 +191,34 @@ func (s *Server) run(ctx context.Context, t turn, chunk func(string)) (result, e
 		return result{}, &errTurn{status: http.StatusInternalServerError, msg: "the turn failed"}
 	}
 	return result{sessionID: begin.SessionID, reply: reply, usage: usage}, nil
+}
+
+// waitConnected waits, up to ConnectWait, for the channel to be up. Without a
+// Connected func it does not wait.
+func (s *Server) waitConnected(ctx context.Context) bool {
+	if s.Connected == nil || s.Connected() {
+		return true
+	}
+	wait := s.ConnectWait
+	if wait <= 0 {
+		wait = DefaultConnectWait
+	}
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	tick := time.NewTicker(connectPoll)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-deadline.C:
+			return s.Connected()
+		case <-tick.C:
+			if s.Connected() {
+				return true
+			}
+		}
+	}
 }
 
 // refusal maps the relay's answer to the caller's: its own 4xx (the caller
