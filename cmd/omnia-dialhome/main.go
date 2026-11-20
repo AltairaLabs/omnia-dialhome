@@ -14,8 +14,10 @@
 //	OMNIA_DIALHOME_PACK      the compiled .pack.json (or -pack)
 //	OMNIA_DIALHOME_PROMPT    the pack prompt to run (or -prompt)
 //	OMNIA_DIALHOME_CLIENT_TOOLS  comma-separated client tools (or -client-tools)
-//	OMNIA_DIALHOME_POLICY_REGISTRY  the name this runtime's tools are governed
-//	                         under (or -policy-registry)
+//	OMNIA_DIALHOME_POLICY_REGISTRY  deprecated: the name this runtime's tools
+//	                         were governed under (or -policy-registry); a
+//	                         current relay ignores it and decides each tool
+//	                         under the ToolRegistry that declares it
 //	OMNIA_DIALHOME_MEMORY    "true" gives conversations the session's memory
 //	                         (or -memory)
 //	OMNIA_DIALHOME_PORT      when set, serve the platform probes on it: /healthz,
@@ -98,7 +100,7 @@ func parse(args []string, getenv func(string) string) (options, error) {
 	prompt := fs.String("prompt", firstSet(getenv, "OMNIA_DIALHOME_PROMPT", envHandoffAgent), "pack prompt to run")
 	tools := fs.String("client-tools", getenv("OMNIA_DIALHOME_CLIENT_TOOLS"), "comma-separated client tools")
 	registry := fs.String("policy-registry", getenv("OMNIA_DIALHOME_POLICY_REGISTRY"),
-		"the name the pack's tools are governed under")
+		"deprecated: the name the pack's tools were governed under; a current relay ignores it")
 	memory := fs.Bool("memory", getenv("OMNIA_DIALHOME_MEMORY") == "true", "give conversations the session's memory")
 	if err := fs.Parse(args); err != nil {
 		return options{}, err

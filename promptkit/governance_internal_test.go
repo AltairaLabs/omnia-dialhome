@@ -225,3 +225,41 @@ func TestMemoryOptions_FollowTheScope(t *testing.T) {
 	assert.Len(t, memoryOptions(dialhome.MemoryScope{Enabled: true}, f, "s1"), 1)
 	assert.Len(t, memoryOptions(dialhome.MemoryScope{Enabled: true, User: true, Tools: true, Retrieval: true}, f, "s1"), 1)
 }
+
+func TestInjectedHeaders_KeptPerCallUntilTheTurnEnds(t *testing.T) {
+	var h injectedHeaders
+	h.put("", map[string]string{"A": "1"})
+	h.put("c1", nil)
+	assert.Nil(t, h.get("c1"), "nothing to keep")
+	in := map[string]string{"X-Site-Token": "tok"}
+	h.put("c1", in)
+	in["X-Site-Token"] = "changed"
+	assert.Equal(t, map[string]string{"X-Site-Token": "tok"}, h.get("c1"), "kept as given")
+	out := h.get("c1")
+	out["X-Site-Token"] = "changed"
+	assert.Equal(t, map[string]string{"X-Site-Token": "tok"}, h.get("c1"), "a reader cannot change them")
+	assert.Nil(t, h.get("c2"))
+	h.clear()
+	assert.Nil(t, h.get("c1"))
+
+	var none *injectedHeaders
+	none.put("c1", in)
+	none.clear()
+	assert.Nil(t, none.get("c1"))
+}
+
+func TestPolicyGate_KeepsAnAllowsInjectedHeaders(t *testing.T) {
+	g := gate(func(context.Context, dialhome.PolicyRequest) (dialhome.PolicyDecision, error) {
+		return dialhome.PolicyDecision{Allow: true, InjectedHeaders: map[string]string{"X-T": "v"}}, nil
+	})
+	g.injected = &injectedHeaders{}
+	require.True(t, g.BeforeExecution(context.Background(), hooks.ToolRequest{Name: "open_ticket", CallID: "c1"}).Allow)
+	assert.Equal(t, map[string]string{"X-T": "v"}, g.injected.get("c1"))
+
+	g = gate(func(context.Context, dialhome.PolicyRequest) (dialhome.PolicyDecision, error) {
+		return dialhome.PolicyDecision{Allow: false, InjectedHeaders: map[string]string{"X-T": "v"}}, nil
+	})
+	g.injected = &injectedHeaders{}
+	require.False(t, g.BeforeExecution(context.Background(), hooks.ToolRequest{Name: "open_ticket", CallID: "c1"}).Allow)
+	assert.Nil(t, g.injected.get("c1"), "never on a refusal")
+}

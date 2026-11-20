@@ -51,7 +51,7 @@ docker run --rm \
 | `OMNIA_DIALHOME_PACK` | `-pack` | The compiled `.pack.json`. Required, unless a deploy hands the pack over (below) |
 | `OMNIA_DIALHOME_PROMPT` | `-prompt` | The pack prompt to run. Required, unless a deploy hands the agent over (below) |
 | `OMNIA_DIALHOME_CLIENT_TOOLS` | `-client-tools` | Comma-separated pack tools the caller's client runs |
-| `OMNIA_DIALHOME_POLICY_REGISTRY` | `-policy-registry` | The name this runtime's tools are governed under: Omnia's tool policies select them by it |
+| `OMNIA_DIALHOME_POLICY_REGISTRY` | `-policy-registry` | **Deprecated.** The name this runtime's tools were governed under. A current Omnia ignores it: see [Declare the tools that run here](#declare-the-tools-that-run-here). Still sent, for an older Omnia |
 | `OMNIA_DIALHOME_MEMORY` | `-memory` | `true` gives conversations the memory Omnia keeps for the session's user |
 | `OMNIA_DIALHOME_PORT` | | When set, serves the [platform probes](#platform-probes) on this port |
 | `PORT` | | The same, when `OMNIA_DIALHOME_PORT` is not set. Azure AI Foundry sets it |
@@ -175,7 +175,6 @@ h, _ := promptkit.New(promptkit.Config{
 	PackPath:       "agent.pack.json",
 	PromptName:     "assistant",
 	Policy:         gov,          // ask before every tool runs here
-	PolicyRegistry: "local-tools", // the name Omnia's policies select these tools by
 	ToolCalls:      gov,          // record each call on the session
 	Memory:         gov,          // the session user's memory, as Omnia scopes it
 	Tools:          gov,          // the agent's tools that Omnia hosts, run in the cluster
@@ -196,6 +195,10 @@ h, _ := promptkit.New(promptkit.Config{
   **Upgrading from v0.1.** A relay that predates policy decisions gives none,
   so from v0.2.0 every tool the pack runs in this process is refused until the
   relay is upgraded too. Client tools are unaffected.
+
+  An allow may carry headers the tool policy adds to the call, such as a
+  token for the tool's backend. Read them in a context-aware handler with
+  `promptkit.InjectedHeaders(ctx)` (see [Injected headers](#injected-headers)).
 - **Tool calls.** Each call the pack ran here is recorded on its session:
   arguments when it starts, then its result or its error. A call Omnia
   refused is recorded by Omnia.
@@ -225,6 +228,59 @@ h, _ := promptkit.New(promptkit.Config{
 
 Every request names only its session. Omnia answers from the identity it
 carried for that session, never from anything the runtime says about it.
+
+### Declare the tools that run here
+
+Omnia runs a tool that runs in this process only if the agent's
+configuration in Omnia declares it: a ToolRegistry handler of `type: remote`,
+with the tool's name, description and input schema, in a registry the agent
+references. Omnia refuses any other tool before asking its policy, with
+`denied_by: dial-home-tool-not-registered`, and decides the rest under the
+registry that declares them. Keep the handler's schema the same as the
+pack's; Omnia logs a difference.
+
+```yaml
+apiVersion: omnia.altairalabs.ai/v1alpha1
+kind: ToolRegistry
+metadata:
+  name: site-tools
+spec:
+  handlers:
+    - name: tickets
+      type: remote
+      tool:
+        name: open_ticket
+        description: Open a ticket in the site's maintenance system.
+        inputSchema: { type: object, properties: { summary: { type: string } } }
+```
+
+**Upgrading.** Earlier versions of Omnia let this runtime name the registry
+its tools were governed under (`PolicyRegistry`,
+`OMNIA_DIALHOME_POLICY_REGISTRY`). A current Omnia ignores that name, so until
+each tool is declared as above, every call to it is refused. The field is
+still sent, so an older Omnia keeps working.
+
+### Injected headers
+
+A tool policy can add headers to a call, for the tool's backend: a tenant
+token, or an API key the backend needs. Omnia sends them with the allow only
+for a tool whose handler sets `remote.acceptInjectedHeaders: true`, and an
+older Omnia never sends them. Read them inside the tool's handler:
+
+```go
+conv.OnToolCtx("open_ticket", func(ctx context.Context, args map[string]any) (any, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, ticketsURL, body(args))
+	for k, v := range promptkit.InjectedHeaders(ctx) {
+		req.Header.Set(k, v)
+	}
+	return send(req)
+})
+```
+
+They are usually credentials. Send them only where the policy meant them to
+go; never log them, return them to the model or keep them past the call.
+They are forgotten when the turn ends. Over the wire they are
+`PolicyDecision.InjectedHeaders`.
 
 `ch.ForwardLocal(dialhome.KindEvents)` and `ch.ForwardLocal(dialhome.KindMemory)`
 give a loopback URL whose requests ride the channel to the agent's session and

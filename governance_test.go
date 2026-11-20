@@ -71,6 +71,28 @@ func TestDecide_CarriesTheCallAndReturnsTheRelaysDecision(t *testing.T) {
 	assert.Equal(t, map[string]any{"amount": float64(5000)}, got["arguments"])
 }
 
+// An allow can carry headers the tool policy adds to the call; a relay that
+// predates the field sends none, and the decision decodes as before.
+func TestDecide_InjectedHeaders(t *testing.T) {
+	g := governed(t, map[dialhome.StreamKind]http.Handler{
+		dialhome.KindPolicy: jsonHandler(t, dialhome.PolicyDecisionPath, func(b map[string]any) (int, any) {
+			if b["tool"] == "old_relay" {
+				return http.StatusOK, map[string]any{"allow": true}
+			}
+			return http.StatusOK, map[string]any{"allow": true, "injected_headers": map[string]string{"X-Site-Token": "tok"}}
+		}),
+	})
+	d, err := g.Decide(context.Background(), dialhome.PolicyRequest{SessionID: "s1", Tool: "open_ticket"})
+	require.NoError(t, err)
+	assert.True(t, d.Allow)
+	assert.Equal(t, map[string]string{"X-Site-Token": "tok"}, d.InjectedHeaders)
+
+	d, err = g.Decide(context.Background(), dialhome.PolicyRequest{SessionID: "s1", Tool: "old_relay"})
+	require.NoError(t, err)
+	assert.True(t, d.Allow)
+	assert.Nil(t, d.InjectedHeaders)
+}
+
 func TestDecide_NoAnswerIsAnErrorNeverAnAllow(t *testing.T) {
 	t.Run("a relay that does not serve policy", func(t *testing.T) {
 		g := governed(t, nil)
