@@ -17,14 +17,14 @@ import (
 )
 
 // HistorySource is where a session's conversation is kept beyond this
-// process: Omnia's record of it, which the relay serves.
+// process: the copy the relay keeps of each conversation it carries.
 // *dialhome.Governance is one.
 type HistorySource interface {
 	History(ctx context.Context, sessionID string) (dialhome.History, error)
 }
 
 // history reads the session's conversation from the configured source, as
-// PromptKit messages. Nil when there is no source, nothing was recorded, or
+// PromptKit messages. Nil when there is no source, nothing was kept, or
 // the source did not answer: the conversation then starts without its
 // earlier turns, as it would have before there was a source.
 func (h *Handler) history(ctx context.Context, id string) []types.Message {
@@ -61,9 +61,9 @@ func resumeOptions(ctx context.Context, id string, history []types.Message) ([]s
 }
 
 // probeHistory answers HasConversation for a session this process does not
-// hold: resumable when Omnia recorded a conversation for it, which a turn
-// will read back. A relay that refused or failed in its own right (a 5xx: the
-// session service unavailable) is unavailable, never a conversation gone;
+// hold: resumable when the relay kept a conversation for it, which a turn
+// will read back. A relay that failed in its own right (a 5xx: its store
+// unavailable) is unavailable, never a conversation gone;
 // anything else, an older relay without the stream included, is not found,
 // as it was before there was a source.
 func (h *Handler) probeHistory(ctx context.Context, id string) server.ResumeState {

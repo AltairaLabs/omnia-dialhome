@@ -14,7 +14,7 @@ This module contains:
 
 | Package | What it is |
 |---|---|
-| `dialhome` (module root) | The channel client: dial out, handshake, keepalive, re-dial; the stream kinds; provider configuration served over the channel (`RemoteConfig`, `ConfigSource`); policy decisions, tool call records, memory, the tools Omnia hosts for the agent and a session's recorded conversation (`Governance`) |
+| `dialhome` (module root) | The channel client: dial out, handshake, keepalive, re-dial; the stream kinds; provider configuration served over the channel (`RemoteConfig`, `ConfigSource`); policy decisions, tool call records, memory, the tools Omnia hosts for the agent and a session's conversation as the relay kept it (`Governance`) |
 | `runtimev1` | The `omnia.runtime.v1` gRPC contract the channel carries, generated from `proto/omnia/runtime/v1/runtime.proto` |
 | `server` | Serves `omnia.runtime.v1` for any `Handler`: hello first, streamed chunks, client tool round-trips, heartbeats, Health |
 | `promptkit` | A `Handler` backed by a [PromptKit](https://github.com/AltairaLabs/PromptKit) pack: one SDK conversation per Omnia session |
@@ -229,12 +229,13 @@ h, _ := promptkit.New(promptkit.Config{
 - **History.** A conversation lives in this process's memory. When a turn
   arrives for a session it does not hold (the platform replaced the container,
   the process restarted, or the conversation idled out), the handler reads the
-  session's conversation as Omnia recorded it and opens the conversation with
+  session's conversation from the copy the relay keeps of each conversation it
+  carries, and opens the conversation with
   those turns before running the turn, the way Omnia's own runtime resumes a
   session from its state store. Only the user's messages and the agent's
   replies carry over, not tool calls or media, and only up to the agent's last
   reply. `HasConversation` answers from the same record, so a client that
-  reconnects to such a session can resume it. With nothing recorded, or a
+  reconnects to such a session can resume it. With nothing kept, or a
   relay without the history stream, the conversation starts empty, as before.
   Do not also give the conversation a state store through `Options`.
 
@@ -319,7 +320,7 @@ memory services in the cluster, for an HTTP client that should reach them.
   | tool-calls | 6 | runtime | HTTP/1.1 `POST /v1/tool-calls`: a tool call the runtime ran |
   | memory-store | 7 | runtime | HTTP/1.1 `POST /v1/memory/{scope,remember,recall,list,forget}`: the session's memory |
   | tools | 8 | runtime | HTTP/1.1 `GET /v1/tools`: the tools Omnia hosts for the agent; `POST /v1/tools/call`: run one in the cluster |
-  | history | 9 | runtime | HTTP/1.1 `POST /v1/history`: a session's conversation as Omnia recorded it, through the agent's last reply |
+  | history | 9 | runtime | HTTP/1.1 `POST /v1/history`: a session's conversation as the relay kept it, through the agent's last reply |
 
   Kinds 4 to 9 were added within version 1. A relay that does not serve one
   closes its streams, and the runtime fails closed: no decision, no tool; no

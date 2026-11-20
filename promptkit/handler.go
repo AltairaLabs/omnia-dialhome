@@ -98,9 +98,9 @@ type Config struct {
 	// is read back from: when a turn arrives for a session with no
 	// conversation here (the process or its container was replaced, or the
 	// conversation idled out), the conversation opens with the session's
-	// earlier turns, as Omnia recorded them, before the turn runs. Only the
+	// earlier turns, as the relay kept them, before the turn runs. Only the
 	// user's and the agent's text carry over, not tool calls or media. With
-	// no history (none recorded, a relay without the stream) the conversation
+	// no history (none kept, a relay without the stream) the conversation
 	// opens empty. It also answers HasConversation for such a session. Do not
 	// also pass sdk.WithStateStore in Options. Over dial-home, pass the
 	// channel's *dialhome.Governance.
@@ -201,7 +201,7 @@ func (h *Handler) Capabilities() []string {
 }
 
 // HasConversation reports whether the session's conversation can go on: it
-// is held here, or (with History) Omnia recorded one that a turn will read
+// is held here, or (with History) the relay kept one that a turn will read
 // back. Without History a conversation lives in this process only, so one
 // that is not held is gone.
 func (h *Handler) HasConversation(ctx context.Context, sessionID string) server.ResumeState {
