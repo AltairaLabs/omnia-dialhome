@@ -193,8 +193,9 @@ func run(args []string, getenv func(string) string) int {
 
 // handlerConfig is the pack served over ch: every tool the pack runs here is
 // put to Omnia's tool policy and recorded on its session, the tools Omnia
-// hosts for the agent are offered and run in the cluster, and with -memory
-// its conversations get the session's memory.
+// hosts for the agent are offered and run in the cluster, a conversation this
+// process does not hold (a new container, say) is read back from the copy
+// the relay keeps, and with -memory its conversations get the session's memory.
 func handlerConfig(
 	opts options, ch dialhome.StreamOpener, src *dialhome.ConfigSource, getenv func(string) string, log logr.Logger,
 ) promptkit.Config {
@@ -205,6 +206,7 @@ func handlerConfig(
 		Policy:    gov,
 		ToolCalls: gov,
 		Tools:     gov,
+		History:   gov,
 		Log:       log,
 
 		PolicyRegistry: opts.registry,

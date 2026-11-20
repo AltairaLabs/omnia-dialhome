@@ -94,6 +94,17 @@ type Config struct {
 	// tools list names it. Over dial-home, pass the channel's
 	// *dialhome.Governance.
 	Tools HostedToolService
+	// History, when set, is where a conversation this process does not hold
+	// is read back from: when a turn arrives for a session with no
+	// conversation here (the process or its container was replaced, or the
+	// conversation idled out), the conversation opens with the session's
+	// earlier turns, as the relay kept them, before the turn runs. Only the
+	// user's and the agent's text carry over, not tool calls or media. With
+	// no history (none kept, a relay without the stream) the conversation
+	// opens empty. It also answers HasConversation for such a session. Do not
+	// also pass sdk.WithStateStore in Options. Over dial-home, pass the
+	// channel's *dialhome.Governance.
+	History HistorySource
 	// Log receives conversation lifecycle events. Zero value discards.
 	Log logr.Logger
 }
@@ -189,15 +200,18 @@ func (h *Handler) Capabilities() []string {
 	return nil
 }
 
-// HasConversation reports whether the session's conversation is held. The
-// conversation lives in this process only, so one that is not held is gone.
-func (h *Handler) HasConversation(_ context.Context, sessionID string) server.ResumeState {
+// HasConversation reports whether the session's conversation can go on: it
+// is held here, or (with History) the relay kept one that a turn will read
+// back. Without History a conversation lives in this process only, so one
+// that is not held is gone.
+func (h *Handler) HasConversation(ctx context.Context, sessionID string) server.ResumeState {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	if _, ok := h.convs[sessionID]; ok {
+	_, ok := h.convs[sessionID]
+	h.mu.Unlock()
+	if ok {
 		return server.ResumeResumable
 	}
-	return server.ResumeNotFound
+	return h.probeHistory(ctx, sessionID)
 }
 
 // EndConversation closes the session's conversation once any turn on it has
@@ -462,7 +476,7 @@ func (h *Handler) open(ctx context.Context, id string) (*session, error) {
 			opts = append(opts, sdk.WithProvider(p))
 		}
 	}
-	conv, err := sdk.Open(h.cfg.PackPath, h.cfg.PromptName, opts...)
+	conv, err := h.openConversation(ctx, id, opts)
 	if err != nil {
 		closeProvider(s.provider)
 		return nil, fmt.Errorf("promptkit: open %s: %w", h.cfg.PackPath, err)
@@ -485,6 +499,26 @@ func (h *Handler) open(ctx context.Context, id string) (*session, error) {
 	}
 	h.cfg.Log.V(1).Info("conversation opened", "sessionID", id)
 	return s, nil
+}
+
+// openConversation opens the session's conversation: resumed from its
+// history when there is one (Omnia's own runtime resumes a session from its
+// state store the same way), else new.
+func (h *Handler) openConversation(ctx context.Context, id string, opts []sdk.Option) (*sdk.Conversation, error) {
+	history := h.history(ctx, id)
+	if len(history) == 0 {
+		return sdk.Open(h.cfg.PackPath, h.cfg.PromptName, opts...)
+	}
+	seed, err := resumeOptions(ctx, id, history)
+	if err != nil {
+		return nil, err
+	}
+	conv, err := sdk.Resume(id, h.cfg.PackPath, h.cfg.PromptName, append(opts, seed...)...)
+	if err != nil {
+		return nil, err
+	}
+	h.cfg.Log.Info("conversation rehydrated", "sessionID", id, "messageCount", len(history))
+	return conv, nil
 }
 
 func (h *Handler) close(id string, s *session) {
