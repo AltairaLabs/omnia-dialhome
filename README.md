@@ -14,7 +14,7 @@ This module contains:
 
 | Package | What it is |
 |---|---|
-| `dialhome` (module root) | The channel client: dial out, handshake, keepalive, re-dial; the stream kinds; provider configuration served over the channel (`RemoteConfig`, `ConfigSource`); policy decisions, tool call records and memory (`Governance`) |
+| `dialhome` (module root) | The channel client: dial out, handshake, keepalive, re-dial; the stream kinds; provider configuration served over the channel (`RemoteConfig`, `ConfigSource`); policy decisions, tool call records, memory and the tools Omnia hosts for the agent (`Governance`) |
 | `runtimev1` | The `omnia.runtime.v1` gRPC contract the channel carries, generated from `proto/omnia/runtime/v1/runtime.proto` |
 | `server` | Serves `omnia.runtime.v1` for any `Handler`: hello first, streamed chunks, client tool round-trips, heartbeats, Health |
 | `promptkit` | A `Handler` backed by a [PromptKit](https://github.com/AltairaLabs/PromptKit) pack: one SDK conversation per Omnia session |
@@ -178,6 +178,7 @@ h, _ := promptkit.New(promptkit.Config{
 	PolicyRegistry: "local-tools", // the name Omnia's policies select these tools by
 	ToolCalls:      gov,          // record each call on the session
 	Memory:         gov,          // the session user's memory, as Omnia scopes it
+	Tools:          gov,          // the agent's tools that Omnia hosts, run in the cluster
 	Configure: func(conv *sdk.Conversation) error {
 		conv.OnTool("open_ticket", openTicket)
 		return nil
@@ -198,6 +199,24 @@ h, _ := promptkit.New(promptkit.Config{
 - **Tool calls.** Each call the pack ran here is recorded on its session:
   arguments when it starts, then its result or its error. A call Omnia
   refused is recorded by Omnia.
+- **Tools Omnia hosts.** The agent's tools in Omnia (its ToolRegistries:
+  HTTP, MCP, gRPC and OpenAPI tools) are listed when a conversation opens and
+  offered to the model with the description and schema Omnia gives them. When
+  the model calls one, the call goes to Omnia and runs in the cluster: Omnia
+  decides it under the agent's tool policy, adds the credentials the tool
+  needs, records it on the session, and sends back only the result. Those
+  credentials never reach this process, and the call is not put to `Policy`
+  or recorded through `ToolCalls`, since Omnia does both. A refusal goes back
+  to the model as the tool's error, in the policy's words. With no list (the
+  channel down when the conversation opens, or a relay without the tools
+  stream) the conversation offers none.
+
+  **A tool the pack defines wins.** If the pack defines a tool with the same
+  name as a hosted one (run here by an `OnTool` handler), or lists it in
+  `ClientTools`, the pack's tool is the one offered and run, and the hosted
+  tool is not offered. To use a hosted tool, name it in the prompt's `tools`
+  list and leave it out of the pack's tool definitions: as with any tool, the
+  model is offered it only if the prompt names it.
 - **Memory.** Conversations get the memory Omnia keeps for the session's user:
   the memory tools, and recall into each turn, as the agent is configured.
   Who the user is, and what they consented to, is Omnia's to decide from the
@@ -231,9 +250,11 @@ memory services in the cluster, for an HTTP client that should reach them.
   | policy | 5 | runtime | HTTP/1.1 `POST /v1/policy/decision`: may this tool call run? |
   | tool-calls | 6 | runtime | HTTP/1.1 `POST /v1/tool-calls`: a tool call the runtime ran |
   | memory-store | 7 | runtime | HTTP/1.1 `POST /v1/memory/{scope,remember,recall,list,forget}`: the session's memory |
+  | tools | 8 | runtime | HTTP/1.1 `GET /v1/tools`: the tools Omnia hosts for the agent; `POST /v1/tools/call`: run one in the cluster |
 
-  Kinds 4 to 7 were added within version 1. A relay that does not serve one
-  closes its streams, and the runtime fails closed: no decision, no tool.
+  Kinds 4 to 8 were added within version 1. A relay that does not serve one
+  closes its streams, and the runtime fails closed: no decision, no tool; no
+  tool list, no hosted tools.
 
 - **Liveness.** yamux keepalives. A dropped session is re-dialled with a
   capped, jittered exponential backoff (1s to 30s).

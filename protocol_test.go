@@ -40,7 +40,8 @@ func TestStreamKindString(t *testing.T) {
 	require.Equal(t, "policy", KindPolicy.String())
 	require.Equal(t, "tool-calls", KindToolCalls.String())
 	require.Equal(t, "memory-store", KindMemoryStore.String())
-	require.Equal(t, "unknown(8)", StreamKind(8).String())
+	require.Equal(t, "tools", KindTools.String())
+	require.Equal(t, "unknown(9)", StreamKind(9).String())
 }
 
 // The wire bytes are the contract with every relay already deployed.

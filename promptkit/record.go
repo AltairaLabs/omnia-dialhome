@@ -41,11 +41,11 @@ const toolStatusFailed = "failed"
 const toolStatusPending = "pending"
 
 // recordToolCalls subscribes to conv's tool call events and records each one
-// through rec, except the client tools (the client's answer is its own
-// record). A call refused before it ran raises no event: one the policy
+// through rec, except those skip names: the client tools (the client's
+// answer is its own record) and the tools Omnia runs (it records them). A call refused before it ran raises no event: one the policy
 // refused is recorded by the relay that refused it, and one PromptKit's own
 // pack blocklist refused is recorded by nobody.
-func recordToolCalls(conv *sdk.Conversation, sessionID string, rec Recorder, client map[string]bool, log logr.Logger) {
+func recordToolCalls(conv *sdk.Conversation, sessionID string, rec Recorder, skip func(string) bool, log logr.Logger) {
 	bus := conv.EventBus()
 	if bus == nil {
 		log.Info("tool calls not recorded: the conversation has no event bus", "sessionID", sessionID)
@@ -58,7 +58,7 @@ func recordToolCalls(conv *sdk.Conversation, sessionID string, rec Recorder, cli
 	// in the order they happened.
 	unsubscribe := bus.SubscribeAll(func(e *events.Event) {
 		r, ok := toolCallRecord(e, sessionID)
-		if !ok || client[r.Tool] {
+		if !ok || skip(r.Tool) {
 			return
 		}
 		select {
