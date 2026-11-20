@@ -113,7 +113,7 @@ func (s *memoryStore) Retrieve(
 		SessionID: s.sessionID, Query: query, Types: opts.Types,
 		Limit: opts.Limit, MinConfidence: opts.MinConfidence,
 	})
-	return toMemories(recs), modelError(err)
+	return orEmpty(toMemories(recs)), modelError(err)
 }
 
 // List implements memory.Store.
@@ -121,7 +121,7 @@ func (s *memoryStore) List(ctx context.Context, _ map[string]string, opts memory
 	recs, err := s.svc.ListMemories(ctx, dialhome.MemoryListRequest{
 		SessionID: s.sessionID, Types: opts.Types, Limit: opts.Limit, Offset: opts.Offset,
 	})
-	return toMemories(recs), modelError(err)
+	return orEmpty(toMemories(recs)), modelError(err)
 }
 
 // Delete implements memory.Store.
@@ -154,6 +154,17 @@ func lastUserText(msgs []types.Message) string {
 		}
 	}
 	return ""
+}
+
+// orEmpty is ms, or an empty list for none. A recall or list that matches
+// nothing answers the memory tools with an empty list, never nil: PromptKit
+// v2.21.0's memory tools marshal a nil list as "memories": null, which their
+// own output schema rejects, so the tool call fails instead of finding nothing.
+func orEmpty(ms []*memory.Memory) []*memory.Memory {
+	if ms == nil {
+		return []*memory.Memory{}
+	}
+	return ms
 }
 
 func toMemories(recs []dialhome.MemoryRecord) []*memory.Memory {
