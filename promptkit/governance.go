@@ -10,8 +10,8 @@ import (
 )
 
 // governanceOptions are the SDK options a conversation for session id gets
-// from Policy and Memory.
-func (h *Handler) governanceOptions(ctx context.Context, id string) []sdk.Option {
+// from Policy and Memory. The tools in hosted are Omnia's to decide.
+func (h *Handler) governanceOptions(ctx context.Context, id string, hosted *hostedRoutes) []sdk.Option {
 	var opts []sdk.Option
 	if h.cfg.Policy != nil {
 		exempt := h.clientTools()
@@ -22,7 +22,7 @@ func (h *Handler) governanceOptions(ctx context.Context, id string) []sdk.Option
 		}
 		opts = append(opts, sdk.WithToolHook(&policyGate{
 			decider: h.cfg.Policy, sessionID: id, registry: h.cfg.PolicyRegistry,
-			exempt: exempt, log: h.cfg.Log,
+			exempt: exempt, hosted: hosted, log: h.cfg.Log,
 		}))
 	}
 	if h.cfg.Memory != nil {

@@ -35,7 +35,9 @@ type policyGate struct {
 	sessionID string
 	registry  string
 	exempt    map[string]bool
-	log       logr.Logger
+	// hosted are the tools Omnia runs, and decides itself in doing so.
+	hosted *hostedRoutes
+	log    logr.Logger
 }
 
 var _ hooks.ToolHook = (*policyGate)(nil)
@@ -47,7 +49,7 @@ func (g *policyGate) Name() string { return "omnia-dialhome-policy" }
 // the tool's error, carrying the policy's message. No answer is a refusal:
 // the channel down, a timeout, a relay that cannot decide.
 func (g *policyGate) BeforeExecution(ctx context.Context, req hooks.ToolRequest) hooks.Decision {
-	if g.exempt[req.Name] {
+	if g.exempt[req.Name] || g.hosted.has(req.Name) {
 		return hooks.Allow
 	}
 	d, err := g.decider.Decide(ctx, dialhome.PolicyRequest{

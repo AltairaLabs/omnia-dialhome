@@ -78,6 +78,19 @@ type Config struct {
 	// scope cannot be read opens without memory. Do not also pass
 	// sdk.WithMemory in Options: the conversation would get two memories.
 	Memory MemoryService
+	// Tools, when set, offers each conversation the tools Omnia hosts for the
+	// agent (its ToolRegistries), listed when the conversation opens. A call
+	// to one runs in the cluster: Omnia decides it under the agent's tool
+	// policy, runs it with credentials that never reach this process, records
+	// it, and returns the result, so Policy and ToolCalls leave it alone. With
+	// no list (the channel down, a relay without the tools stream) the
+	// conversation offers none. A tool the pack defines (or a client tool)
+	// wins over a hosted tool of the same name, so an OnTool handler is never
+	// displaced: leave a hosted tool out of the pack's tool definitions. As
+	// with any tool, the model is offered a hosted tool only if the prompt's
+	// tools list names it. Over dial-home, pass the channel's
+	// *dialhome.Governance.
+	Tools HostedToolService
 	// Log receives conversation lifecycle events. Zero value discards.
 	Log logr.Logger
 }
@@ -428,8 +441,9 @@ func (h *Handler) takeIdle() map[string]*session {
 
 func (h *Handler) open(ctx context.Context, id string) (*session, error) {
 	s := newSession(h.now())
+	hosted, routes := h.hostedTools(ctx, id), &hostedRoutes{}
 	opts := append([]sdk.Option{sdk.WithConversationID(id)}, h.cfg.Options...)
-	opts = append(opts, h.governanceOptions(ctx, id)...)
+	opts = append(opts, h.governanceOptions(ctx, id, routes)...)
 	if h.cfg.Provider != nil {
 		// Not the stream's ctx: the provider lives with the conversation, and
 		// a credential source may keep its ctx to refresh tokens with.
@@ -451,8 +465,11 @@ func (h *Handler) open(ctx context.Context, id string) (*session, error) {
 	for _, name := range h.cfg.ClientTools {
 		conv.OnClientTool(name, s.clientTool)
 	}
+	client := h.clientTools()
+	installHosted(conv, hosted, h.cfg.Tools, id, routes, client, h.cfg.Log)
 	if h.cfg.ToolCalls != nil {
-		recordToolCalls(conv, id, h.cfg.ToolCalls, h.clientTools(), h.cfg.Log)
+		recordToolCalls(conv, id, h.cfg.ToolCalls, func(name string) bool { return client[name] || routes.has(name) },
+			h.cfg.Log)
 	}
 	if h.cfg.Configure != nil {
 		if err := h.cfg.Configure(conv); err != nil {

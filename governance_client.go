@@ -37,10 +37,10 @@ const (
 var ErrNoDecision = errors.New("dial-home: no policy decision")
 
 // Governance is the runtime's client for the governance streams: policy
-// decisions, tool call records and the session's memory. Its methods are safe
-// for concurrent use.
+// decisions, tool call records, the session's memory, and the tools Omnia
+// hosts for the agent. Its methods are safe for concurrent use.
 type Governance struct {
-	policy, toolCalls, memory *http.Client
+	policy, toolCalls, memory, tools *http.Client
 	// PolicyTimeout bounds Decide; DefaultPolicyTimeout when zero.
 	PolicyTimeout time.Duration
 }
@@ -51,6 +51,7 @@ func NewGovernance(c StreamOpener) *Governance {
 		policy:    streamHTTPClient(c, KindPolicy),
 		toolCalls: streamHTTPClient(c, KindToolCalls),
 		memory:    streamHTTPClient(c, KindMemoryStore),
+		tools:     streamHTTPClient(c, KindTools),
 	}
 }
 
@@ -157,6 +158,12 @@ func post(ctx context.Context, hc *http.Client, path string, in, out any) error 
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	return do(hc, req, path, out)
+}
+
+// do sends req and decodes a 2xx answer into out (when out is set). Any
+// other status is a *RelayError.
+func do(hc *http.Client, req *http.Request, path string, out any) error {
 	resp, err := hc.Do(req)
 	if err != nil {
 		return err

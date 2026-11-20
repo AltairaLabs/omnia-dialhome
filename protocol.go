@@ -71,6 +71,11 @@ const (
 	// Memory*Path operations, scoped by the relay to the session's user, not
 	// by the runtime. KindMemory is the raw HTTP forward and stays as it was.
 	KindMemoryStore StreamKind = 7
+	// KindTools (runtime → relay, HTTP) is the tools Omnia hosts for the
+	// agent: ToolsPath lists them and ToolsCallPath runs one in the cluster.
+	// Fail closed: a relay that predates it closes the stream, and the runtime
+	// offers no Omnia-hosted tools.
+	KindTools StreamKind = 8
 )
 
 func (k StreamKind) String() string {
@@ -89,6 +94,8 @@ func (k StreamKind) String() string {
 		return "tool-calls"
 	case KindMemoryStore:
 		return "memory-store"
+	case KindTools:
+		return "tools"
 	default:
 		return fmt.Sprintf("unknown(%d)", byte(k))
 	}
