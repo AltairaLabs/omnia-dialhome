@@ -22,7 +22,10 @@
 //	                         (or -memory)
 //	OMNIA_DIALHOME_PORT      when set, serve the platform probes on it: /healthz,
 //	                         /readyz, / (Vertex), /readiness (Foundry), /ping
-//	                         and /invocations (AgentCore); see probeHandler
+//	                         (AgentCore), and the front door: the platforms'
+//	                         invoke routes; see probeHandler
+//	OMNIA_DIALHOME_PLATFORM  the platform the front door reports a turn
+//	                         arrived on, when its route does not say; optional
 //	PORT                     the same, when OMNIA_DIALHOME_PORT is unset (Foundry
 //	                         sets it)
 //
@@ -56,6 +59,7 @@ import (
 	"github.com/go-logr/logr"
 
 	dialhome "github.com/AltairaLabs/omnia-dialhome"
+	"github.com/AltairaLabs/omnia-dialhome/frontdoor"
 	"github.com/AltairaLabs/omnia-dialhome/promptkit"
 	"github.com/AltairaLabs/omnia-dialhome/providerspec"
 	"github.com/AltairaLabs/omnia-dialhome/server"
@@ -177,7 +181,7 @@ func run(args []string, getenv func(string) string) int {
 			log.Error(err, "probe port not bound", "port", opts.port)
 			return exitServe
 		}
-		go serveProbes(ctx, l, ch, log)
+		go serveProbes(ctx, l, ch, frontDoor(h, ch, getenv, log), log)
 	}
 	go func() {
 		<-ctx.Done()
@@ -215,6 +219,22 @@ func handlerConfig(
 		cfg.Memory = gov
 	}
 	return cfg
+}
+
+// frontDoor serves h on the platform's invoke routes, each turn opened and
+// ended with the relay over ch.
+func frontDoor(h server.Handler, ch dialhome.StreamOpener, getenv func(string) string, log logr.Logger) *frontdoor.Server {
+	fd := &frontdoor.Server{
+		Handler: h, Relay: dialhome.NewGovernance(ch), Platform: getenv("OMNIA_DIALHOME_PLATFORM"),
+		SessionFallback: getenv("FOUNDRY_AGENT_SESSION_ID"), Log: log.WithName("front-door"),
+	}
+	if c, ok := ch.(interface{ Connected() bool }); ok {
+		fd.Connected = c.Connected
+	}
+	if fd.Platform == "" && getenv("FOUNDRY_PROJECT_ENDPOINT") != "" {
+		fd.Platform = frontdoor.PlatformFoundry
+	}
+	return fd
 }
 
 // firstSet returns the value of the first of names that is set.
@@ -274,27 +294,27 @@ const (
 	pingHealthyBusy = "HealthyBusy"
 )
 
-// errInvokeHere is the answer to an invocation made to the container directly.
-const errInvokeHere = "this runtime is served over Omnia's dial-home channel and takes no invocations here: " +
-	"invoke the agent through Omnia"
-
 // probeHandler serves what the platforms that host the runtime probe on its
-// port. Every liveness check answers while the process runs, whether or not
-// the channel is connected: a platform that restarts an unhealthy container
-// would otherwise kill it while it re-dials an unreachable relay.
+// port, and the front door (package frontdoor): the platforms' own invoke
+// routes, each turn governed over the channel. Every liveness check answers
+// while the process runs, whether or not the channel is connected: a platform
+// that restarts an unhealthy container would otherwise kill it while it
+// re-dials an unreachable relay.
 //
 //   - GET /healthz: 200 while the process runs.
 //   - GET /readyz: 200 while the channel is connected, else 503.
 //   - GET /: 200 while the process runs (Vertex Agent Runtime's health check).
 //   - GET /readiness: 200 while the process runs (Azure AI Foundry hosted
 //     agents' readiness probe).
-//   - GET /ping: AgentCore's health check, always 200: {"status":"HealthyBusy"}
-//     while the channel is connected, which keeps the AgentCore session alive,
-//     and {"status":"Healthy"} while it is not.
-//   - POST /invocations: the invoke route of AgentCore and of Foundry's
-//     Invocations protocol, answered with 501 and a JSON error. Conversations
-//     arrive over the channel, not here.
-func probeHandler(connected func() bool) http.Handler {
+//   - GET /ping: AgentCore's health check, always 200. {"status":"HealthyBusy"}
+//     while a front-door turn runs, or while the channel of a container the
+//     relay started (its session start) is connected: that container holds the
+//     channel for Omnia's own turns, and HealthyBusy keeps its session alive.
+//     Otherwise {"status":"Healthy"}, so a session a caller opened idles out
+//     between turns rather than being billed to its maximum lifetime.
+//   - POST /invocations, /responses, /api/reasoning_engine,
+//     /api/stream_reasoning_engine: the front door.
+func probeHandler(connected func() bool, fd *frontdoor.Server) http.Handler {
 	mux := http.NewServeMux()
 	ok := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }
 	mux.HandleFunc("GET /healthz", ok)
@@ -309,14 +329,12 @@ func probeHandler(connected func() bool) http.Handler {
 	})
 	mux.HandleFunc("GET /ping", func(w http.ResponseWriter, _ *http.Request) {
 		status := pingHealthy
-		if connected() {
+		if fd.Busy() || (fd.Kicked() && connected()) {
 			status = pingHealthyBusy
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": status})
 	})
-	mux.HandleFunc("POST /invocations", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusNotImplemented, map[string]string{"status": "error", "error": errInvokeHere})
-	})
+	fd.Register(mux)
 	return mux
 }
 
@@ -327,8 +345,8 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 // serveProbes serves probeHandler on l until ctx is done.
-func serveProbes(ctx context.Context, l net.Listener, ch *dialhome.Client, log logr.Logger) {
-	srv := &http.Server{Handler: probeHandler(ch.Connected), ReadHeaderTimeout: 5 * time.Second}
+func serveProbes(ctx context.Context, l net.Listener, ch *dialhome.Client, fd *frontdoor.Server, log logr.Logger) {
+	srv := &http.Server{Handler: probeHandler(ch.Connected, fd), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
 		_ = srv.Close()

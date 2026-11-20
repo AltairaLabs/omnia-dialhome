@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	dialhome "github.com/AltairaLabs/omnia-dialhome"
+	"github.com/AltairaLabs/omnia-dialhome/frontdoor"
 )
 
 func env(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
@@ -135,7 +136,7 @@ func probe(t *testing.T, h http.Handler, method, path string) *httptest.Response
 // that is re-dialling an unreachable relay.
 func TestProbeHandler_LiveWhetherOrNotConnected(t *testing.T) {
 	for _, connected := range []bool{false, true} {
-		h := probeHandler(func() bool { return connected })
+		h := probeHandler(func() bool { return connected }, &frontdoor.Server{})
 		for _, path := range []string{"/healthz", "/", "/readiness", "/ping"} {
 			assert.Equal(t, http.StatusOK, probe(t, h, http.MethodGet, path).Code, "GET %s, connected=%v", path, connected)
 		}
@@ -144,38 +145,37 @@ func TestProbeHandler_LiveWhetherOrNotConnected(t *testing.T) {
 
 func TestProbeHandler_Readyz(t *testing.T) {
 	assert.Equal(t, http.StatusServiceUnavailable,
-		probe(t, probeHandler(func() bool { return false }), http.MethodGet, "/readyz").Code)
-	assert.Equal(t, http.StatusOK, probe(t, probeHandler(func() bool { return true }), http.MethodGet, "/readyz").Code)
+		probe(t, probeHandler(func() bool { return false }, &frontdoor.Server{}), http.MethodGet, "/readyz").Code)
+	assert.Equal(t, http.StatusOK, probe(t, probeHandler(func() bool { return true }, &frontdoor.Server{}), http.MethodGet, "/readyz").Code)
 }
 
-// AgentCore's /ping: Healthy while dialling, HealthyBusy while connected, so
-// the session is kept alive while it carries conversations.
+// AgentCore's /ping: HealthyBusy only for the container the relay started,
+// while its channel is up, and during a front-door turn; Healthy otherwise, so
+// a session a caller opened idles out.
 func TestProbeHandler_AgentCorePing(t *testing.T) {
-	for connected, want := range map[bool]string{false: "Healthy", true: "HealthyBusy"} {
-		rec := probe(t, probeHandler(func() bool { return connected }), http.MethodGet, "/ping")
+	ping := func(connected bool, fd *frontdoor.Server) string {
+		rec := probe(t, probeHandler(func() bool { return connected }, fd), http.MethodGet, "/ping")
 		require.Equal(t, http.StatusOK, rec.Code)
 		assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
 		var body map[string]any
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
-		assert.Equal(t, map[string]any{"status": want}, body, "connected=%v; no time_of_last_update", connected)
+		return body["status"].(string)
 	}
-}
-
-func TestProbeHandler_InvocationsRefused(t *testing.T) {
-	rec := probe(t, probeHandler(func() bool { return true }), http.MethodPost, "/invocations")
-	assert.Equal(t, http.StatusNotImplemented, rec.Code)
-	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
-	var body map[string]string
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
-	assert.Equal(t, "error", body["status"])
-	assert.Contains(t, body["error"], "dial-home")
-	assert.Contains(t, body["error"], "through Omnia")
+	assert.Equal(t, "Healthy", ping(true, &frontdoor.Server{}), "a caller's container, connected, between turns")
+	kicked := &frontdoor.Server{}
+	h := probeHandler(func() bool { return true }, kicked)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/invocations", strings.NewReader(`{"omnia_dial_home":"start"}`)))
+	require.Equal(t, http.StatusAccepted, rec.Code, "a session start runs no turn")
+	assert.Equal(t, "HealthyBusy", ping(true, kicked), "the relay's own container holds the channel")
+	assert.Equal(t, "Healthy", ping(false, kicked), "not while dialling")
 }
 
 func TestProbeHandler_UnknownRoutes(t *testing.T) {
-	h := probeHandler(func() bool { return true })
+	h := probeHandler(func() bool { return true }, &frontdoor.Server{})
 	assert.Equal(t, http.StatusNotFound, probe(t, h, http.MethodGet, "/nope").Code)
 	assert.Equal(t, http.StatusMethodNotAllowed, probe(t, h, http.MethodGet, "/invocations").Code)
+	assert.Equal(t, http.StatusMethodNotAllowed, probe(t, h, http.MethodGet, "/responses").Code)
 	assert.Equal(t, http.StatusMethodNotAllowed, probe(t, h, http.MethodPost, "/ping").Code)
 }
 
@@ -192,7 +192,7 @@ func TestServeProbes(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { serveProbes(ctx, l, ch, logr.Discard()); close(done) }()
+	go func() { serveProbes(ctx, l, ch, &frontdoor.Server{}, logr.Discard()); close(done) }()
 
 	resp, err := http.Get("http://" + addr + "/ping") //nolint:noctx // test
 	require.NoError(t, err)

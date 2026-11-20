@@ -17,6 +17,7 @@ This module contains:
 | `dialhome` (module root) | The channel client: dial out, handshake, keepalive, re-dial; the stream kinds; provider configuration served over the channel (`RemoteConfig`, `ConfigSource`); policy decisions, tool call records, memory, the tools Omnia hosts for the agent and a session's conversation as the relay kept it (`Governance`) |
 | `runtimev1` | The `omnia.runtime.v1` gRPC contract the channel carries, generated from `proto/omnia/runtime/v1/runtime.proto` |
 | `server` | Serves `omnia.runtime.v1` for any `Handler`: hello first, streamed chunks, client tool round-trips, heartbeats, Health |
+| `frontdoor` | Serves the platform's own invoke API (the "front door"), running each turn here and having Omnia govern it over the channel |
 | `promptkit` | A `Handler` backed by a [PromptKit](https://github.com/AltairaLabs/PromptKit) pack: one SDK conversation per Omnia session |
 | `providerspec` | Builds a PromptKit provider from a provider the relay serves |
 | `cmd/omnia-dialhome` | The entrypoint the container image runs |
@@ -53,7 +54,8 @@ docker run --rm \
 | `OMNIA_DIALHOME_CLIENT_TOOLS` | `-client-tools` | Comma-separated pack tools the caller's client runs |
 | `OMNIA_DIALHOME_POLICY_REGISTRY` | `-policy-registry` | **Deprecated.** The name this runtime's tools were governed under. A current Omnia ignores it: see [Declare the tools that run here](#declare-the-tools-that-run-here). Still sent, for an older Omnia |
 | `OMNIA_DIALHOME_MEMORY` | `-memory` | `true` gives conversations the memory Omnia keeps for the session's user |
-| `OMNIA_DIALHOME_PORT` | | When set, serves the [platform probes](#platform-probes) on this port |
+| `OMNIA_DIALHOME_PORT` | | When set, serves the [platform probes](#platform-probes) and the [front door](#the-front-door) on this port |
+| `OMNIA_DIALHOME_PLATFORM` | | The platform the front door reports a turn arrived on (`agentcore`, `vertex`, `foundry`) when its route does not say. Optional |
 | `PORT` | | The same, when `OMNIA_DIALHOME_PORT` is not set. Azure AI Foundry sets it |
 
 ### Platform probes
@@ -70,23 +72,19 @@ never get the chance to connect.
 | `GET /readyz` | `200` while the channel is connected, else `503` | Readiness, where a platform should route nothing to a runtime that cannot serve |
 | `GET /` | `200` while the process runs | Vertex Agent Runtime's health check |
 | `GET /readiness` | `200` while the process runs | Azure AI Foundry hosted agents' readiness probe |
-| `GET /ping` | `200`, `{"status":"HealthyBusy"}` while the channel is connected, else `{"status":"Healthy"}` | AWS Bedrock AgentCore's health check |
-| `POST /invocations` | `501`, `{"status":"error","error":"…invoke the agent through Omnia"}` | AgentCore's invoke route, and Foundry's Invocations protocol |
-
-Conversations reach the runtime over the channel, never through the platform's
-own invoke API, so `/invocations` answers with an error rather than serving a
-second path. On AgentCore, `InvokeAgentRuntime` therefore returns
-`424 RuntimeClientError`; that is expected.
+| `GET /ping` | `200`, `{"status":"HealthyBusy"}` while a front-door turn runs, or while the channel of a container Omnia started is connected; else `{"status":"Healthy"}` | AWS Bedrock AgentCore's health check |
+| `POST /invocations`, `POST /responses`, `POST /api/reasoning_engine`, `POST /api/stream_reasoning_engine` | The [front door](#the-front-door) | The platforms' invoke routes |
 
 - **AgentCore.** Serve the default port: set `OMNIA_DIALHOME_PORT=8080`, and
   leave `protocolConfiguration.path` at `/invocations`. AgentCore starts a
-  container for a runtime session, which an `InvokeAgentRuntime` call opens,
-  so something must make one invocation to start it; that call returns the
-  `424` above while the container starts and dials home. `HealthyBusy` marks
-  the session active, so AgentCore keeps a connected runtime up past its idle
-  timeout, to the session's maximum lifetime, although no further invocation
-  reaches it. The session is billed for that time. The response omits the
-  optional `time_of_last_update`.
+  container for a runtime session, which an `InvokeAgentRuntime` call opens.
+  When Omnia needs a container for its own turns and none is connected, it
+  opens one with a session start (`{"omnia_dial_home":"start"}`), answered
+  `202` without running a turn. That container answers `HealthyBusy` while its
+  channel is up, so AgentCore keeps it to the session's maximum lifetime (and
+  bills it). A container a caller's session started is `HealthyBusy` only while
+  a turn runs, so it idles out between turns. The response omits the optional
+  `time_of_last_update`.
 - **Vertex Agent Runtime.** Set `OMNIA_DIALHOME_PORT=8080`. Do not point a
   health check at `/readyz`: while the relay is unreachable it answers `503`,
   and a runtime that is reported unhealthy for that is never left up long
@@ -96,6 +94,49 @@ second path. On AgentCore, `InvokeAgentRuntime` therefore returns
   probe's `max_seconds` after the last request.
 - **Azure AI Foundry.** Foundry passes `PORT` and probes `/readiness`, so no
   port setting is needed. `OMNIA_DIALHOME_PORT`, when set, takes precedence.
+
+### The front door
+
+The container also serves the platform's own invoke API, so an app can call
+the agent the way that platform's agents are called, and the platform scales
+the containers. Each turn runs here, through the same handler the channel
+serves, and Omnia governs it over the channel exactly as it governs a turn it
+sends: the turn is opened with the relay (stream kind 10), which verifies the
+caller and names the session; every tool, memory call and history read in the
+turn is decided for that session; and the reply is recorded.
+
+| Route | Platform | Message | Session | Answer |
+|---|---|---|---|---|
+| `POST /invocations` | AgentCore, Foundry invocations | JSON `prompt`, `message` or `input`; a body that is not JSON is the message | AgentCore's `X-Amzn-Bedrock-AgentCore-Runtime-Session-Id`, else `agent_session_id` in the query, else `session_id` in the body, else `FOUNDRY_AGENT_SESSION_ID` | `{"response", "session_id"}`; SSE (`chunk` then `done` events) with `Accept: text/event-stream` |
+| `POST /responses` | Foundry responses | `input`: a string, or the text of the last user message item | `agent_session_id`, else `conversation` | A Responses object (`output_text`, one `message` output item); its SSE events with `"stream": true` |
+| `POST /api/reasoning_engine` | Vertex Agent Runtime `:query` | `input.message` | `input.session_id` | `{"output", "session_id"}` |
+| `POST /api/stream_reasoning_engine` | Vertex Agent Runtime `:streamQuery` | `input.message` | `input.session_id` | NDJSON: `{"output": chunk}` lines, then `{"session_id", "done": true}` |
+
+**Who the caller is.** The platform decides who may invoke the agent; Omnia
+decides who the user is. The container forwards the caller's identity token
+to Omnia unread, and Omnia verifies it against the issuers its agent trusts.
+Nothing this process says about the caller is used. The token is read from,
+first present:
+
+1. `Authorization: Bearer <token>`. On AgentCore, configure the runtime with a
+   JWT authorizer and add `Authorization` to its request header allowlist,
+   and the caller's token reaches the container already checked by AgentCore.
+2. `X-Amzn-Bedrock-AgentCore-Runtime-Custom-Omnia-Identity` (AgentCore, when
+   the authorizer's token is not the user's).
+3. `X-Client-Omnia-Identity` (Foundry, which strips `Authorization` and passes
+   `x-client-*` headers).
+4. `X-Omnia-Identity` (anywhere else).
+5. `input.identity_token` in the body (Vertex). On the Vertex routes only
+   this field and `X-Omnia-Identity` count: Agent Runtime fills
+   `Authorization` with a Google token for its own hop, which is not the
+   caller's identity, and is ignored.
+
+A token Omnia does not accept is answered `401` and nothing runs. With no
+token, Omnia's agent decides: `401`, or a turn with no user. With the channel
+down, or a relay that predates the front door, the answer is `503`.
+
+**What it does not do.** No client tools: nobody on the other end of a
+platform invocation can run one. Media parts are not taken; a turn is text.
 
 ### Deployed by PromptArena
 
@@ -321,11 +362,12 @@ memory services in the cluster, for an HTTP client that should reach them.
   | memory-store | 7 | runtime | HTTP/1.1 `POST /v1/memory/{scope,remember,recall,list,forget}`: the session's memory |
   | tools | 8 | runtime | HTTP/1.1 `GET /v1/tools`: the tools Omnia hosts for the agent; `POST /v1/tools/call`: run one in the cluster |
   | history | 9 | runtime | HTTP/1.1 `POST /v1/history`: a session's conversation as the relay kept it, through the agent's last reply |
+  | front-door | 10 | runtime | HTTP/1.1 `POST /v1/front-door/turns`: open a turn that arrived on the platform's invoke API; `POST /v1/front-door/turns/{turn}/end`: end it |
 
-  Kinds 4 to 9 were added within version 1. A relay that does not serve one
+  Kinds 4 to 10 were added within version 1. A relay that does not serve one
   closes its streams, and the runtime fails closed: no decision, no tool; no
   tool list, no hosted tools; no history, a conversation without its earlier
-  turns.
+  turns; no front-door stream, no front-door turn.
 
 - **Liveness.** yamux keepalives. A dropped session is re-dialled with a
   capped, jittered exponential backoff (1s to 30s).

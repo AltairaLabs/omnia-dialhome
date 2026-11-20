@@ -42,7 +42,8 @@ func TestStreamKindString(t *testing.T) {
 	require.Equal(t, "memory-store", KindMemoryStore.String())
 	require.Equal(t, "tools", KindTools.String())
 	require.Equal(t, "history", KindHistory.String())
-	require.Equal(t, "unknown(10)", StreamKind(10).String())
+	require.Equal(t, "front-door", KindFrontDoor.String())
+	require.Equal(t, "unknown(11)", StreamKind(11).String())
 }
 
 // The wire bytes are the contract with every relay already deployed.
@@ -54,6 +55,8 @@ func TestStreamKinds_AreTheWireBytes(t *testing.T) {
 	require.Equal(t, "/v1/config", ConfigPath)
 	require.Equal(t, "/v1/policy/decision", PolicyDecisionPath)
 	require.Equal(t, "/v1/tool-calls", ToolCallsPath)
+	require.Equal(t, byte(10), byte(KindFrontDoor))
+	require.Equal(t, "/v1/front-door/turns", FrontDoorTurnsPath)
 	for _, p := range []string{MemoryScopePath, MemoryRememberPath, MemoryRecallPath, MemoryListPath, MemoryForgetPath} {
 		require.Regexp(t, `^/v1/memory/[a-z]+$`, p)
 	}
