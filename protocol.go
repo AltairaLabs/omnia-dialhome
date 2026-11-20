@@ -76,6 +76,11 @@ const (
 	// Fail closed: a relay that predates it closes the stream, and the runtime
 	// offers no Omnia-hosted tools.
 	KindTools StreamKind = 8
+	// KindHistory (runtime → relay, HTTP) is a session's conversation as
+	// Omnia recorded it, at HistoryPath, for a runtime that no longer holds it.
+	// A relay that predates it closes the stream, and the conversation goes on
+	// without its earlier turns, as before.
+	KindHistory StreamKind = 9
 )
 
 func (k StreamKind) String() string {
@@ -96,6 +101,8 @@ func (k StreamKind) String() string {
 		return "memory-store"
 	case KindTools:
 		return "tools"
+	case KindHistory:
+		return "history"
 	default:
 		return fmt.Sprintf("unknown(%d)", byte(k))
 	}

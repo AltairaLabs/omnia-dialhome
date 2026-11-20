@@ -37,10 +37,10 @@ const (
 var ErrNoDecision = errors.New("dial-home: no policy decision")
 
 // Governance is the runtime's client for the governance streams: policy
-// decisions, tool call records, the session's memory, and the tools Omnia
-// hosts for the agent. Its methods are safe for concurrent use.
+// decisions, tool call records, the session's memory, the tools Omnia hosts
+// for the agent, and the session's conversation as Omnia recorded it. Its methods are safe for concurrent use.
 type Governance struct {
-	policy, toolCalls, memory, tools *http.Client
+	policy, toolCalls, memory, tools, history *http.Client
 	// PolicyTimeout bounds Decide; DefaultPolicyTimeout when zero.
 	PolicyTimeout time.Duration
 }
@@ -52,6 +52,7 @@ func NewGovernance(c StreamOpener) *Governance {
 		toolCalls: streamHTTPClient(c, KindToolCalls),
 		memory:    streamHTTPClient(c, KindMemoryStore),
 		tools:     streamHTTPClient(c, KindTools),
+		history:   streamHTTPClient(c, KindHistory),
 	}
 }
 
