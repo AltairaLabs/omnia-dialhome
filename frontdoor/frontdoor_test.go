@@ -272,6 +272,15 @@ func TestVertex(t *testing.T) {
 	assert.JSONEq(t, `{"output":"echo: "}`, lines[0])
 	assert.Contains(t, lines[2], `"done":true`)
 
+	// Agent Runtime's own Authorization is not the caller's identity.
+	noTok := `{"input":{"message":"hi","session_id":"vx-2"}}`
+	require.Equal(t, http.StatusOK, do(mux, http.MethodPost, "/api/reasoning_engine", noTok,
+		map[string]string{"Authorization": "Bearer google-platform-token"}).Code)
+	assert.Empty(t, relay.begins[len(relay.begins)-1].IdentityToken)
+	require.Equal(t, http.StatusOK, do(mux, http.MethodPost, "/api/reasoning_engine", noTok,
+		map[string]string{frontdoor.HeaderIdentity: "t2"}).Code)
+	assert.Equal(t, "t2", relay.begins[len(relay.begins)-1].IdentityToken)
+
 	relay.err = &dialhome.RelayError{Status: 401}
 	assert.Equal(t, http.StatusUnauthorized, do(mux, http.MethodPost, "/api/stream_reasoning_engine", q, nil).Code)
 	assert.Equal(t, http.StatusBadRequest, do(mux, http.MethodPost, "/api/reasoning_engine", "x", nil).Code)

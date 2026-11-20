@@ -234,6 +234,14 @@ func identityToken(h http.Header) string {
 			return tok
 		}
 	}
+	return explicitIdentityToken(h)
+}
+
+// explicitIdentityToken is a token from the headers a caller sets for the
+// front door, never Authorization: where a platform fills Authorization with
+// a credential of its own (Agent Runtime does), that credential is not the
+// caller's identity.
+func explicitIdentityToken(h http.Header) string {
 	for _, name := range []string{HeaderAgentCoreIdentity, HeaderFoundryIdentity, HeaderIdentity} {
 		if v := strings.TrimSpace(h.Get(name)); v != "" {
 			return strings.TrimSpace(strings.TrimPrefix(v, "Bearer "))

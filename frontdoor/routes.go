@@ -112,8 +112,9 @@ func (s *Server) serveResponses(w http.ResponseWriter, r *http.Request) {
 
 // serveVertex is Agent Runtime's query (:query) and stream query
 // (:streamQuery) on a custom container. The body is
-// {"class_method", "input": {"message", "session_id", "identity_token"}}: no
-// header reaches the container, so the caller's identity token rides input.
+// {"class_method", "input": {"message", "session_id", "identity_token"}}: the
+// caller's headers do not reach the container, so the caller's identity token
+// rides input (or X-Omnia-Identity, from a proxy in front).
 // query answers {"output"}; stream query answers NDJSON {"output"} lines.
 func (s *Server) serveVertex(stream bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -123,9 +124,12 @@ func (s *Server) serveVertex(stream bool) http.HandlerFunc {
 			return
 		}
 		in, _ := body["input"].(map[string]any)
+		// Not the Authorization header: Agent Runtime fills it with a Google
+		// token of its own for the platform hop, which says nothing about the
+		// end user. Only a token the caller put in the request counts.
 		token := str(in, "identity_token")
 		if token == "" {
-			token = identityToken(r.Header)
+			token = explicitIdentityToken(r.Header)
 		}
 		t := turn{platform: PlatformVertex, session: str(in, "session_id"), token: token,
 			text: str(in, "message", "prompt", "input")}

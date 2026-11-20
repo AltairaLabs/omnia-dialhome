@@ -126,8 +126,10 @@ first present:
 3. `X-Client-Omnia-Identity` (Foundry, which strips `Authorization` and passes
    `x-client-*` headers).
 4. `X-Omnia-Identity` (anywhere else).
-5. `input.identity_token` in the body (Vertex, which passes no header to the
-   container).
+5. `input.identity_token` in the body (Vertex). On the Vertex routes only
+   this field and `X-Omnia-Identity` count: Agent Runtime fills
+   `Authorization` with a Google token for its own hop, which is not the
+   caller's identity, and is ignored.
 
 A token Omnia does not accept is answered `401` and nothing runs. With no
 token, Omnia's agent decides: `401`, or a turn with no user. With the channel
