@@ -81,6 +81,11 @@ const (
 	// A relay that predates it closes the stream, and the conversation goes on
 	// without its earlier turns, as before.
 	KindHistory StreamKind = 9
+	// KindFrontDoor (runtime → relay, HTTP) opens and ends a turn that
+	// reached the runtime through its platform's own invoke API, at
+	// FrontDoorTurnsPath. A relay that predates it closes the stream, and the
+	// front door serves no turn.
+	KindFrontDoor StreamKind = 10
 )
 
 func (k StreamKind) String() string {
@@ -103,6 +108,8 @@ func (k StreamKind) String() string {
 		return "tools"
 	case KindHistory:
 		return "history"
+	case KindFrontDoor:
+		return "front-door"
 	default:
 		return fmt.Sprintf("unknown(%d)", byte(k))
 	}

@@ -40,7 +40,7 @@ var ErrNoDecision = errors.New("dial-home: no policy decision")
 // decisions, tool call records, the session's memory, the tools Omnia hosts
 // for the agent, and the session's conversation as Omnia recorded it. Its methods are safe for concurrent use.
 type Governance struct {
-	policy, toolCalls, memory, tools, history *http.Client
+	policy, toolCalls, memory, tools, history, frontDoor *http.Client
 	// PolicyTimeout bounds Decide; DefaultPolicyTimeout when zero.
 	PolicyTimeout time.Duration
 }
@@ -53,6 +53,7 @@ func NewGovernance(c StreamOpener) *Governance {
 		memory:    streamHTTPClient(c, KindMemoryStore),
 		tools:     streamHTTPClient(c, KindTools),
 		history:   streamHTTPClient(c, KindHistory),
+		frontDoor: streamHTTPClient(c, KindFrontDoor),
 	}
 }
 
