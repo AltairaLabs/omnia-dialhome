@@ -176,6 +176,16 @@ func TestGovernance_MemoryToolsReachTheSessionsMemory(t *testing.T) {
 		assert.Equal(t, "the user prefers metric units", g.saved[0].Content)
 		assert.Empty(t, g.asked, "memory tools are not put to the tool policy")
 	})
+	t.Run("a recall that matches nothing finds nothing, and does not fail", func(t *testing.T) {
+		g := &governor{scope: dialhome.MemoryScope{Enabled: true, User: true, Tools: true}}
+		var ran atomic.Int32
+		h := siteHandler(t, g, &ran, calling("memory__recall", map[string]any{"query": "favourite colour"}))
+		require.NoError(t, h.Converse(context.Background(), server.Turn{SessionID: "s1", Content: "recall"}, &collect{}))
+		require.Eventually(t, func() bool { return len(g.records()) == 2 }, 5*time.Second, 10*time.Millisecond)
+		done := g.records()[1]
+		assert.Equal(t, dialhome.ToolCallCompleted, done.Phase, "error: %s", done.Error)
+		assert.JSONEq(t, `{"count":0,"memories":[]}`, done.Result)
+	})
 	t.Run("no user: no memory tools", func(t *testing.T) {
 		g := &governor{scope: dialhome.MemoryScope{Enabled: true, Tools: true}}
 		var ran atomic.Int32

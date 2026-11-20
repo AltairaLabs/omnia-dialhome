@@ -194,8 +194,10 @@ func TestMemoryStore_EveryOperationGoesToTheSession(t *testing.T) {
 	assert.Equal(t, dialhome.MemoryRecallRequest{SessionID: "s1", Query: "units", Limit: 3,
 		Types: []string{"preference"}}, f.recalled[0], "the scope PromptKit passes is not sent: the relay scopes")
 
-	_, err = s.List(ctx, nil, memory.ListOptions{Limit: 10, Offset: 5})
+	listed, err := s.List(ctx, nil, memory.ListOptions{Limit: 10, Offset: 5})
 	require.NoError(t, err)
+	assert.NotNil(t, listed, "nothing listed is an empty list, not nil")
+	assert.Empty(t, listed)
 	assert.Equal(t, dialhome.MemoryListRequest{SessionID: "s1", Limit: 10, Offset: 5}, f.listed[0])
 
 	require.NoError(t, s.Delete(ctx, nil, "m1"))
