@@ -66,8 +66,11 @@ type Config struct {
 	// handler runs. PromptKit runs no hooks for a duplex session's tools or a
 	// workflow's composed tool steps; this handler serves neither.
 	Policy Decider
-	// PolicyRegistry is the name this runtime's tools are governed under: a
-	// tool policy selects them by it (PolicyRequest.Registry).
+	// PolicyRegistry is the name this runtime's tools were governed under
+	// (PolicyRequest.Registry). It is deprecated: a current relay ignores it,
+	// decides each tool under the ToolRegistry that declares the tool as a
+	// remote handler, and refuses a tool no such handler declares. It is
+	// still sent, for an older relay.
 	PolicyRegistry string
 	// ToolCalls, when set, records each tool the pack runs in this process on
 	// its session: started, then completed or failed.
@@ -121,6 +124,8 @@ type session struct {
 	turn chan struct{}
 	// ended is set once the conversation is closed.
 	ended atomic.Bool
+	// injected is the current turn's injected headers, per call.
+	injected *injectedHeaders
 
 	mu      sync.Mutex
 	emit    server.Emitter
@@ -128,7 +133,7 @@ type session struct {
 }
 
 func newSession(now time.Time) *session {
-	return &session{lastUsed: now, turn: make(chan struct{}, 1)}
+	return &session{lastUsed: now, turn: make(chan struct{}, 1), injected: &injectedHeaders{}}
 }
 
 func (s *session) acquire(ctx context.Context) error {
@@ -268,7 +273,8 @@ func (h *Handler) Converse(ctx context.Context, t server.Turn, emit server.Emitt
 	}
 	s.setTurn(emit, t.ClientToolsAvailable)
 	defer s.setTurn(nil, false)
-	return stream(ctx, s.conv, msg, opts, emit)
+	defer s.injected.clear()
+	return stream(withInjectedHeaders(ctx, s.injected), s.conv, msg, opts, emit)
 }
 
 // stream runs the turn and relays it. It always drains the SDK's stream, so
@@ -443,7 +449,7 @@ func (h *Handler) open(ctx context.Context, id string) (*session, error) {
 	s := newSession(h.now())
 	hosted, routes := h.hostedTools(ctx, id), &hostedRoutes{}
 	opts := append([]sdk.Option{sdk.WithConversationID(id)}, h.cfg.Options...)
-	opts = append(opts, h.governanceOptions(ctx, id, routes)...)
+	opts = append(opts, h.governanceOptions(ctx, id, routes, s.injected)...)
 	if h.cfg.Provider != nil {
 		// Not the stream's ctx: the provider lives with the conversation, and
 		// a credential source may keep its ctx to refresh tokens with.

@@ -37,7 +37,9 @@ type policyGate struct {
 	exempt    map[string]bool
 	// hosted are the tools Omnia runs, and decides itself in doing so.
 	hosted *hostedRoutes
-	log    logr.Logger
+	// injected keeps an allow's injected headers for the call's handler.
+	injected *injectedHeaders
+	log      logr.Logger
 }
 
 var _ hooks.ToolHook = (*policyGate)(nil)
@@ -69,6 +71,7 @@ func (g *policyGate) BeforeExecution(ctx context.Context, req hooks.ToolRequest)
 		}
 		return hooks.DenyWithMetadata(reason, map[string]any{"denied_by": d.DeniedBy, "policy": d.Policy})
 	}
+	g.injected.put(req.CallID, d.InjectedHeaders)
 	return hooks.Allow
 }
 

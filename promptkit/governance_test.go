@@ -330,3 +330,52 @@ func TestGovernance_AToolThatFailsIsRecordedAsFailed(t *testing.T) {
 	assert.Equal(t, dialhome.ToolCallFailed, last.Phase)
 	assert.Contains(t, last.Error, "sensor offline")
 }
+
+// An allow's injected headers reach the tool's handler through its context,
+// for that call only, and nothing of them outlives the turn.
+func TestGovernance_InjectedHeadersReachTheToolsHandler(t *testing.T) {
+	g := &governor{decision: dialhome.PolicyDecision{Allow: true,
+		InjectedHeaders: map[string]string{"X-Site-Token": "tok"}}}
+	var got []map[string]string
+	var mu sync.Mutex
+	h := newHandler(t, promptkit.Config{
+		Provider: calling("get_location", nil), Policy: g,
+		Configure: func(conv *sdk.Conversation) error {
+			conv.OnToolCtx("get_location", func(ctx context.Context, _ map[string]any) (any, error) {
+				mu.Lock()
+				got = append(got, promptkit.InjectedHeaders(ctx))
+				mu.Unlock()
+				return map[string]any{"room": "control"}, nil
+			})
+			return nil
+		},
+	})
+	require.NoError(t, h.Converse(context.Background(), server.Turn{SessionID: "s1", Content: "where?"}, &collect{}))
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, got, 1)
+	assert.Equal(t, map[string]string{"X-Site-Token": "tok"}, got[0])
+
+	assert.Nil(t, promptkit.InjectedHeaders(context.Background()), "outside a tool call there are none")
+}
+
+// A relay that sends no injected headers (an older one, or a tool not opted
+// in) gives the handler none.
+func TestGovernance_NoInjectedHeadersIsNil(t *testing.T) {
+	g := &governor{decision: dialhome.PolicyDecision{Allow: true}}
+	var got map[string]string
+	called := false
+	h := newHandler(t, promptkit.Config{
+		Provider: calling("get_location", nil), Policy: g,
+		Configure: func(conv *sdk.Conversation) error {
+			conv.OnToolCtx("get_location", func(ctx context.Context, _ map[string]any) (any, error) {
+				called, got = true, promptkit.InjectedHeaders(ctx)
+				return "ok", nil
+			})
+			return nil
+		},
+	})
+	require.NoError(t, h.Converse(context.Background(), server.Turn{SessionID: "s1", Content: "where?"}, &collect{}))
+	assert.True(t, called)
+	assert.Nil(t, got)
+}

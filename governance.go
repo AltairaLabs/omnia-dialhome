@@ -47,9 +47,11 @@ type PolicyRequest struct {
 	CallID string `json:"call_id"`
 	// Tool is the tool's name.
 	Tool string `json:"tool"`
-	// Registry is the name the runtime's own tools are governed under: they
-	// belong to no registry in the cluster, so a policy selects them by this.
-	// Empty sends none, and a policy that selects by registry does not match.
+	// Registry is the name the runtime's own tools were governed under. It
+	// is deprecated: a current relay ignores it, and decides each tool under
+	// the ToolRegistry that declares it as a remote handler, refusing a tool
+	// no such handler declares. It is still sent, for an older relay that
+	// reads it.
 	Registry string `json:"registry,omitempty"`
 	// Arguments are the call's arguments, as the model gave them.
 	Arguments json.RawMessage `json:"arguments,omitempty"`
@@ -66,6 +68,11 @@ type PolicyDecision struct {
 	DeniedBy string `json:"denied_by,omitempty"`
 	// Policy names the policy that decided, when the relay knows it.
 	Policy string `json:"policy,omitempty"`
+	// InjectedHeaders are headers the tool policy adds to this call, for the
+	// runtime to send with it to the tool's backend. Only on an allow, and
+	// only for a tool its operator has opted in: they are usually
+	// credentials. An older relay never sends them.
+	InjectedHeaders map[string]string `json:"injected_headers,omitempty"`
 }
 
 // Tool call phases, ToolCallRecord.Phase.
