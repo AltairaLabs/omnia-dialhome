@@ -57,7 +57,16 @@ type ClientConfig struct {
 	MinBackoff, MaxBackoff time.Duration
 	// KeepAlive is the yamux keepalive interval.
 	KeepAlive time.Duration
+	// Revision is the revision of the agent this runtime serves: the version
+	// of its compiled pack, or a revision id its operator chose. When set it
+	// is sent as HeaderPackVersion on every handshake, so the relay can tell
+	// revisions of the same agent apart. Optional; at most MaxRevisionLength
+	// printable ASCII characters, with no leading or trailing space.
+	Revision string
 }
+
+// MaxRevisionLength bounds ClientConfig.Revision.
+const MaxRevisionLength = 128
 
 // ConfigFromEnv reads the runtime-side config from EnvURL and EnvKey. ok is
 // false when neither is set — the runtime is not configured to dial home,
@@ -92,6 +101,24 @@ func (c ClientConfig) Validate() error {
 		// re-dial; in clear text over the internet anyone on the path could
 		// take it and become the agent's runtime.
 		return fmt.Errorf("dial-home: %s: ws:// is allowed only to loopback or in-cluster hosts; use wss://", EnvURL)
+	}
+	return ValidateRevision(c.Revision)
+}
+
+// ValidateRevision checks r can be ClientConfig.Revision: a header value the
+// relay reads back unchanged, so printable ASCII, at most MaxRevisionLength
+// characters, and not padded with space. Empty is valid: no revision.
+func ValidateRevision(r string) error {
+	if len(r) > MaxRevisionLength {
+		return fmt.Errorf("dial-home: revision is %d characters; at most %d are allowed", len(r), MaxRevisionLength)
+	}
+	for i := 0; i < len(r); i++ {
+		if r[i] < 0x20 || r[i] > 0x7e {
+			return fmt.Errorf("dial-home: revision %q: only printable ASCII is allowed", r)
+		}
+	}
+	if strings.TrimSpace(r) != r {
+		return fmt.Errorf("dial-home: revision %q: no leading or trailing space is allowed", r)
 	}
 	return nil
 }
@@ -178,6 +205,10 @@ func (c *Client) Close() error {
 
 // Addr reports the relay URL as the listener address.
 func (c *Client) Addr() net.Addr { return Addr(c.cfg.URL) }
+
+// Revision is the revision this client reports on its handshake, or "" when
+// it reports none.
+func (c *Client) Revision() string { return c.cfg.Revision }
 
 // Connected reports whether a session is live.
 func (c *Client) Connected() bool { return c.session() != nil }
@@ -277,6 +308,9 @@ func (c *Client) connectOnce(ctx context.Context) error {
 	hdr := http.Header{}
 	hdr.Set("Authorization", "Bearer "+c.cfg.Key)
 	hdr.Set(HeaderVersion, ProtocolVersion)
+	if c.cfg.Revision != "" {
+		hdr.Set(HeaderPackVersion, c.cfg.Revision)
+	}
 	d := websocket.Dialer{
 		HandshakeTimeout: HandshakeTimeout,
 		TLSClientConfig:  c.cfg.TLSConfig,
@@ -298,7 +332,7 @@ func (c *Client) connectOnce(ctx context.Context) error {
 		return err
 	}
 	c.setSession(sess)
-	c.log.Info("dial-home channel connected", "url", c.cfg.URL)
+	c.log.Info("dial-home channel connected", "url", c.cfg.URL, "revision", c.cfg.Revision)
 	defer func() {
 		c.setSession(nil)
 		_ = sess.Close()

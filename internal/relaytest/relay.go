@@ -40,6 +40,9 @@ type Relay struct {
 	mu         sync.Mutex
 	sessions   []*yamux.Session
 	handshakes atomic.Int32
+	// packVersions are the HeaderPackVersion values of the accepted
+	// handshakes, in order; nil for one that sent none.
+	packVersions []*string
 }
 
 // New starts a relay that accepts key, and terminates the runtime's streams
@@ -81,6 +84,21 @@ func (r *Relay) HTTPURL() string { return r.srv.URL }
 
 // Handshakes is how many handshakes the relay accepted.
 func (r *Relay) Handshakes() int { return int(r.handshakes.Load()) }
+
+// PackVersions are the HeaderPackVersion values the accepted handshakes
+// carried, in order. sent[i] is false for a handshake that carried none.
+func (r *Relay) PackVersions() (values []string, sent []bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, v := range r.packVersions {
+		if v == nil {
+			values, sent = append(values, ""), append(sent, false)
+			continue
+		}
+		values, sent = append(values, *v), append(sent, true)
+	}
+	return values, sent
+}
 
 // Connected is the number of live sessions.
 func (r *Relay) Connected() int {
@@ -165,10 +183,15 @@ func (r *Relay) serve(w http.ResponseWriter, req *http.Request) {
 		_ = ws.Close()
 		return
 	}
-	r.handshakes.Add(1)
+	var packVersion *string
+	if vs := req.Header.Values(dialhome.HeaderPackVersion); len(vs) > 0 {
+		packVersion = &vs[0]
+	}
 	r.mu.Lock()
 	r.sessions = append(r.sessions, sess)
+	r.packVersions = append(r.packVersions, packVersion)
 	r.mu.Unlock()
+	r.handshakes.Add(1)
 	for {
 		st, err := sess.AcceptStream()
 		if err != nil {

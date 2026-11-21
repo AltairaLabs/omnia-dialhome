@@ -121,6 +121,32 @@ func TestClient_RedialsAfterTheChannelDrops(t *testing.T) {
 	}, 5*time.Second, 50*time.Millisecond)
 }
 
+// The revision rides every handshake, re-dials included, so a relay can tell
+// revisions of the same agent apart; a client with none sends no header.
+func TestClient_HandshakeCarriesTheRevision(t *testing.T) {
+	relay := relaytest.New(t, testKey, nil)
+	c, err := dialhome.Dial(context.Background(), dialhome.ClientConfig{
+		URL: relay.URL(), Key: testKey, Log: logr.Discard(), Revision: "1.4.0",
+		MinBackoff: 20 * time.Millisecond, MaxBackoff: 100 * time.Millisecond, KeepAlive: relaytest.KeepAlive,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+	assert.Equal(t, "1.4.0", c.Revision())
+	waitConnected(t, relay, 1)
+	relay.Drop()
+	require.Eventually(t, func() bool { return relay.Handshakes() >= 2 }, 5*time.Second, 10*time.Millisecond)
+	values, sent := relay.PackVersions()
+	assert.Equal(t, []string{"1.4.0", "1.4.0"}, values[:2])
+	assert.Equal(t, []bool{true, true}, sent[:2])
+
+	bare := relaytest.New(t, testKey, nil)
+	c2 := dial(t, bare, testKey)
+	assert.Empty(t, c2.Revision())
+	waitConnected(t, bare, 1)
+	_, sent = bare.PackVersions()
+	assert.Equal(t, []bool{false}, sent, "no revision, no header")
+}
+
 func TestClient_KeepsRedialingARefusedKey(t *testing.T) {
 	relay := relaytest.New(t, testKey, nil)
 

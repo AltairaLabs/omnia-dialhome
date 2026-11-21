@@ -31,7 +31,12 @@
 //   - Handshake: GET ChannelPath with `Authorization: Bearer <key>` and
 //     HeaderVersion: ProtocolVersion. The key is an Omnia-issued dial-home key
 //     scoped to one AgentRuntime. A missing or unknown key is refused with 401
-//     before the upgrade; an unsupported version with 400.
+//     before the upgrade; an unsupported version with 400. Optionally,
+//     HeaderPackVersion names the revision of the agent the runtime serves
+//     (ClientConfig.Revision: its pack's version, or an operator-chosen id),
+//     so the relay can tell revisions of the same agent apart, for example to
+//     route a staged revision's turns or attribute sessions to a revision. A
+//     relay that predates it ignores it.
 //   - Streams: the opener writes {streamVersion, kind} and then the stream is
 //     the protocol named by kind. A kind the receiver does not serve is closed
 //     at once — the channel is not a general-purpose tunnel.

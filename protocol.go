@@ -18,6 +18,14 @@ const (
 	ChannelPath = "/v1/channel"
 	// HeaderVersion carries the channel protocol version on the handshake.
 	HeaderVersion = "X-Omnia-Dial-Home-Version"
+	// HeaderPackVersion optionally carries, on the handshake, the revision of
+	// the agent this runtime serves: the version of the compiled pack it runs,
+	// or a revision id its operator chose (ClientConfig.Revision). It lets a
+	// relay tell revisions of the same agent apart, for example to route a
+	// staged revision's turns to it or to attribute sessions to a revision. It
+	// is omitted when the runtime has no revision. Added within version 1: a
+	// relay that predates it ignores it. Never rename it.
+	HeaderPackVersion = "X-Omnia-Dial-Home-Pack-Version"
 	// ProtocolVersion is the only channel version this package speaks.
 	ProtocolVersion = "1"
 	// HandshakeTimeout bounds the WebSocket handshake, on either end.

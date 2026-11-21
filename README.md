@@ -54,6 +54,7 @@ docker run --rm \
 | `OMNIA_DIALHOME_CLIENT_TOOLS` | `-client-tools` | Comma-separated pack tools the caller's client runs |
 | `OMNIA_DIALHOME_POLICY_REGISTRY` | `-policy-registry` | **Deprecated.** The name this runtime's tools were governed under. A current Omnia ignores it: see [Declare the tools that run here](#declare-the-tools-that-run-here). Still sent, for an older Omnia |
 | `OMNIA_DIALHOME_MEMORY` | `-memory` | `true` gives conversations the memory Omnia keeps for the session's user |
+| `OMNIA_DIALHOME_REVISION` | `-revision` | The [revision](#the-agents-revision) of the agent this runtime reports to Omnia. Optional; defaults to the pack's `version` |
 | `OMNIA_DIALHOME_PORT` | | When set, serves the [platform probes](#platform-probes) and the [front door](#the-front-door) on this port |
 | `OMNIA_DIALHOME_PLATFORM` | | The platform the front door reports a turn arrived on (`agentcore`, `vertex`, `foundry`) when its route does not say. Optional |
 | `PORT` | | The same, when `OMNIA_DIALHOME_PORT` is not set. Azure AI Foundry sets it |
@@ -164,6 +165,20 @@ sent; it is listed as withheld, and `OMNIA_DIAL_HOME_CONFIG` can supply it.
 With no configuration at all PromptKit chooses from the pack and the
 environment, as it does anywhere else.
 
+### The agent's revision
+
+Every handshake reports which revision of the agent this runtime is, in the
+`X-Omnia-Dial-Home-Pack-Version` header: the `-revision` flag, else
+`OMNIA_DIALHOME_REVISION`, else the `version` field of the compiled pack it
+runs (including a pack handed over in `PROMPTPACK_PACK_JSON`). With none, the
+header is not sent. The relay can then tell revisions of the same agent apart,
+for example to route a staged revision's turns to it, or to attribute sessions
+to the revision that served them. The revision is logged at startup.
+
+A revision is at most 128 printable ASCII characters with no leading or
+trailing space. A given revision that is not is refused at startup; a pack
+version that is not is logged and not reported.
+
 `ws://` is refused unless the host is loopback or an in-cluster Service name
 (`*.svc`, `*.svc.cluster.local`): the key rides every handshake.
 
@@ -181,6 +196,9 @@ if err != nil {
 	log.Fatal(err)
 }
 defer ch.Close()
+
+// Optionally, report which revision of the agent this is on the handshake:
+// set cfg.Revision before Dial. ch.Revision() reads it back.
 
 // ch is a net.Listener: the relay's runtime streams arrive on Accept.
 log.Fatal(server.Serve(ch, myHandler))
@@ -346,7 +364,11 @@ memory services in the cluster, for an HTTP client that should reach them.
   session in binary messages.
 - **Handshake.** `GET /v1/channel` with `Authorization: Bearer <key>` and
   `X-Omnia-Dial-Home-Version: 1`. A key the relay does not accept is refused
-  with 401 before the upgrade, an unsupported version with 400.
+  with 401 before the upgrade, an unsupported version with 400. Optionally,
+  `X-Omnia-Dial-Home-Pack-Version: <revision>` names the revision of the agent
+  the runtime serves (the pack's version, or a revision id its operator chose),
+  so the relay can tell revisions of the same agent apart. It was added within
+  version 1; a relay that predates it ignores it.
 - **Streams.** The opener of every stream writes two bytes, `{1, kind}`, and
   the stream is then the protocol `kind` names. A kind the receiver does not
   serve is closed at once.

@@ -260,3 +260,73 @@ func TestHandlerConfig_GovernsEveryConversation(t *testing.T) {
 	cfg = handlerConfig(options{pack: "p", prompt: "q", memory: true}, c, src, env(nil), logr.Discard())
 	assert.NotNil(t, cfg.Memory)
 }
+
+func writeTestPack(t *testing.T, body string) string {
+	t.Helper()
+	path, cleanup, err := writePack(body)
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	return path
+}
+
+// The revision reported on the handshake is the one given, else the pack's
+// version; a pack version a header cannot carry is not reported.
+func TestRevision(t *testing.T) {
+	log := logr.Discard()
+	pack := writeTestPack(t, `{"id":"p","version":"1.4.0","prompts":{}}`)
+
+	o, err := parse(nil, env(map[string]string{
+		"OMNIA_DIALHOME_PACK": pack, "OMNIA_DIALHOME_PROMPT": "chat",
+	}))
+	require.NoError(t, err)
+	assert.Equal(t, "1.4.0", revision(o, log), "the pack's version when none is given")
+
+	o, err = parse(nil, env(map[string]string{
+		"OMNIA_DIALHOME_PACK": pack, "OMNIA_DIALHOME_PROMPT": "chat", "OMNIA_DIALHOME_REVISION": "canary-7",
+	}))
+	require.NoError(t, err)
+	assert.Equal(t, "canary-7", revision(o, log), "the environment wins over the pack")
+
+	o, err = parse([]string{"-revision", "r9"}, env(map[string]string{
+		"OMNIA_DIALHOME_PACK": pack, "OMNIA_DIALHOME_PROMPT": "chat", "OMNIA_DIALHOME_REVISION": "canary-7",
+	}))
+	require.NoError(t, err)
+	assert.Equal(t, "r9", revision(o, log), "the flag wins over the environment")
+
+	for _, body := range []string{`{"id":"p"}`, `{"version":3}`, `{"version":"bad\nvalue"}`, `not json`} {
+		assert.Empty(t, revision(options{pack: writeTestPack(t, body)}, log), body)
+	}
+	assert.Empty(t, revision(options{pack: "/does/not/exist.pack.json"}, log))
+}
+
+// A pack handed over inline is the pack whose version is reported.
+func TestRevision_DeployHandoff(t *testing.T) {
+	o, err := parse(nil, env(map[string]string{
+		"PROMPTPACK_PACK_JSON": `{"id":"p","version":"2.0.1"}`, "PROMPTPACK_AGENT": "assistant",
+	}))
+	require.NoError(t, err)
+	o, rev, cleanup, err := preparePack(o, logr.Discard())
+	require.NoError(t, err)
+	defer cleanup()
+	assert.NotEmpty(t, o.pack, "the inline pack is written to a file")
+	assert.Equal(t, "2.0.1", rev)
+}
+
+// A revision the command was given that a header cannot carry stops it
+// before it dials. The probe port is held, so a run that got past the dial
+// would stop there instead, with exitServe.
+func TestRun_RefusesAnInvalidRevision(t *testing.T) {
+	l, err := net.Listen("tcp", ":0")
+	require.NoError(t, err)
+	defer func() { _ = l.Close() }()
+	_, port, err := net.SplitHostPort(l.Addr().String())
+	require.NoError(t, err)
+	e := map[string]string{
+		"OMNIA_DIALHOME_PACK": "a.pack.json", "OMNIA_DIALHOME_PROMPT": "chat",
+		"OMNIA_DIAL_HOME_URL": "ws://127.0.0.1:1/v1/channel", "OMNIA_DIAL_HOME_KEY": "k",
+		"OMNIA_DIALHOME_PORT": port, "OMNIA_DIALHOME_REVISION": "1.0",
+	}
+	assert.Equal(t, exitServe, run(nil, env(e)), "a valid revision gets past the dial")
+	e["OMNIA_DIALHOME_REVISION"] = "1.0\r\nX-Injected: 1"
+	assert.Equal(t, exitConfig, run(nil, env(e)))
+}
