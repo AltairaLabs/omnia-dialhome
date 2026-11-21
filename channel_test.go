@@ -61,6 +61,14 @@ func waitConnected(t *testing.T, r *relaytest.Relay, n int) {
 	require.Eventually(t, func() bool { return r.Connected() == n }, 5*time.Second, 10*time.Millisecond)
 }
 
+// waitBothConnected waits for c's one session to be live at both ends. The
+// relay holds its end of a session before the client holds its own, so a
+// client-side stream opened on the relay's word alone can find none.
+func waitBothConnected(t *testing.T, r *relaytest.Relay, c *dialhome.Client) {
+	t.Helper()
+	require.Eventually(t, func() bool { return r.Connected() == 1 && c.Connected() }, 5*time.Second, 10*time.Millisecond)
+}
+
 func converse(ctx context.Context, cc *grpc.ClientConn, text string) (string, error) {
 	// gzip, as the facade sends text turns.
 	stream, err := runtimev1.NewRuntimeServiceClient(cc).Converse(ctx, grpc.UseCompressor(gzip.Name))
@@ -174,7 +182,7 @@ func TestChannel_ForwardCarriesHTTPToItsKindOnly(t *testing.T) {
 	})
 	relay := relaytest.New(t, testKey, map[dialhome.StreamKind]http.Handler{dialhome.KindEvents: events})
 	c := dial(t, relay, testKey)
-	waitConnected(t, relay, 1)
+	waitBothConnected(t, relay, c)
 
 	fwd, err := c.ForwardLocal(dialhome.KindEvents)
 	require.NoError(t, err)
@@ -241,7 +249,7 @@ func TestConfig_OverTheChannelThenBaked(t *testing.T) {
 		dialhome.KindConfig: configUpstream(modelCfg("from-channel"), &reads),
 	})
 	c := dial(t, relay, testKey)
-	waitConnected(t, relay, 1)
+	waitBothConnected(t, relay, c)
 
 	got, err := c.FetchConfig(context.Background())
 	require.NoError(t, err)
