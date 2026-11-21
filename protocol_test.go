@@ -61,6 +61,7 @@ func TestStreamKinds_AreTheWireBytes(t *testing.T) {
 		require.Regexp(t, `^/v1/memory/[a-z]+$`, p)
 	}
 	require.Equal(t, "X-Omnia-Dial-Home-Version", HeaderVersion)
+	require.Equal(t, "X-Omnia-Dial-Home-Pack-Version", HeaderPackVersion)
 	require.Equal(t, "1", ProtocolVersion)
 }
 
@@ -133,6 +134,23 @@ func TestWSOnlyToLoopbackOrInClusterHosts(t *testing.T) {
 	} {
 		err := ClientConfig{URL: url, Key: "k"}.Validate()
 		require.Equal(t, ok, err == nil, "%s: %v", url, err)
+	}
+}
+
+// A revision must come back from the relay's header unchanged, so anything
+// a header cannot carry intact is refused.
+func TestValidate_Revision(t *testing.T) {
+	ok := func(rev string) error {
+		return ClientConfig{URL: "wss://relay.example/v1/channel", Key: "k", Revision: rev}.Validate()
+	}
+	for _, good := range []string{"", "1.4.0", "rev-2026-11-21_a", "v2 (staged)", strings.Repeat("a", MaxRevisionLength)} {
+		require.NoError(t, ok(good), good)
+	}
+	for _, bad := range []string{
+		"1.0\r\nX-Evil: 1", "1.0\n", "tab\there", "caf\u00e9", "\x00", " 1.0", "1.0 ",
+		strings.Repeat("a", MaxRevisionLength+1),
+	} {
+		require.Error(t, ok(bad), "%q", bad)
 	}
 }
 

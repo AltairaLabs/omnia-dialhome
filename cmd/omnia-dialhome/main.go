@@ -20,6 +20,9 @@
 //	                         under the ToolRegistry that declares it
 //	OMNIA_DIALHOME_MEMORY    "true" gives conversations the session's memory
 //	                         (or -memory)
+//	OMNIA_DIALHOME_REVISION  the revision of the agent this runtime reports on
+//	                         the channel handshake (or -revision); defaults to
+//	                         the pack's version
 //	OMNIA_DIALHOME_PORT      when set, serve the platform probes on it: /healthz,
 //	                         /readyz, / (Vertex), /readiness (Foundry), /ping
 //	                         (AgentCore), and the front door: the platforms'
@@ -96,6 +99,9 @@ type options struct {
 	registry string
 	// memory gives conversations the session's memory, through the relay.
 	memory bool
+	// revision is the revision reported on the handshake; when empty, the
+	// pack's version is.
+	revision string
 }
 
 func parse(args []string, getenv func(string) string) (options, error) {
@@ -106,11 +112,13 @@ func parse(args []string, getenv func(string) string) (options, error) {
 	registry := fs.String("policy-registry", getenv("OMNIA_DIALHOME_POLICY_REGISTRY"),
 		"deprecated: the name the pack's tools were governed under; a current relay ignores it")
 	memory := fs.Bool("memory", getenv("OMNIA_DIALHOME_MEMORY") == "true", "give conversations the session's memory")
+	revision := fs.String("revision", getenv("OMNIA_DIALHOME_REVISION"),
+		"the revision reported to the relay on the handshake (default: the pack's version)")
 	if err := fs.Parse(args); err != nil {
 		return options{}, err
 	}
 	o := options{pack: *pack, prompt: *prompt, port: firstSet(getenv, "OMNIA_DIALHOME_PORT", "PORT"),
-		registry: *registry, memory: *memory}
+		registry: *registry, memory: *memory, revision: *revision}
 	if o.pack == "" {
 		if getenv(envHandoffPackJSON) == "" && getenv(envHandoffPackURI) != "" {
 			return options{}, fmt.Errorf("the deploy staged the pack at %s=%s, which is not supported: "+
@@ -137,21 +145,19 @@ func run(args []string, getenv func(string) string) int {
 		log.Error(err, "usage")
 		return exitUsage
 	}
-	if opts.packJSON != "" {
-		path, cleanup, err := writePack(opts.packJSON)
-		if err != nil {
-			log.Error(err, "pack not written")
-			return exitConfig
-		}
-		defer cleanup()
-		opts.pack = path
+	opts, rev, cleanup, err := preparePack(opts, log)
+	if err != nil {
+		log.Error(err, "pack not written")
+		return exitConfig
 	}
+	defer cleanup()
 	cfg, ok, err := dialhome.ConfigFromEnv(getenv)
 	if err != nil || !ok {
 		log.Error(err, "dial-home is not configured: set OMNIA_DIAL_HOME_URL and OMNIA_DIAL_HOME_KEY")
 		return exitConfig
 	}
 	cfg.Log = log
+	cfg.Revision = rev
 	baked, _, err := dialhome.BakedConfigFromEnv(getenv)
 	if err != nil {
 		log.Error(err, "baked config ignored")
@@ -187,12 +193,71 @@ func run(args []string, getenv func(string) string) int {
 		<-ctx.Done()
 		_ = ch.Close()
 	}()
-	log.Info("serving over dial-home", "pack", opts.pack, "prompt", opts.prompt)
+	log.Info("serving over dial-home", "pack", opts.pack, "prompt", opts.prompt, "revision", cfg.Revision)
 	if err := server.Serve(ch, h, server.WithLogger(log)); err != nil {
 		log.Error(err, "serve failed")
 		return exitServe
 	}
 	return exitOK
+}
+
+// preparePack writes a pack handed over inline to a file, so opts.pack names
+// the pack in every case, and resolves the revision to report from it.
+// cleanup removes what it wrote.
+func preparePack(opts options, log logr.Logger) (_ options, rev string, cleanup func(), err error) {
+	cleanup = func() {}
+	if opts.packJSON != "" {
+		path, c, err := writePack(opts.packJSON)
+		if err != nil {
+			return opts, "", cleanup, err
+		}
+		opts.pack, cleanup = path, c
+	}
+	return opts, revision(opts, log), cleanup, nil
+}
+
+// revision is the revision to report on the handshake: the one the command
+// was given, else the pack's version. A pack version a header cannot carry is
+// logged and not reported; a given revision is checked by Dial, which refuses
+// to start with one that is invalid.
+func revision(opts options, log logr.Logger) string {
+	if opts.revision != "" {
+		return opts.revision
+	}
+	v, err := packVersion(opts.pack)
+	if err != nil {
+		log.Info("pack version not read; no revision reported", "err", err.Error())
+		return ""
+	}
+	if err := dialhome.ValidateRevision(v); err != nil {
+		log.Info("pack version is not a valid revision; no revision reported", "err", err.Error())
+		return ""
+	}
+	return v
+}
+
+// packVersion is the version field of the compiled pack at path, or "" when
+// it has none.
+func packVersion(path string) (string, error) {
+	f, err := os.Open(path) //nolint:gosec // the operator's own pack
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	var p struct {
+		Version json.RawMessage `json:"version"`
+	}
+	if err := json.NewDecoder(f).Decode(&p); err != nil {
+		return "", fmt.Errorf("pack %s: %w", path, err)
+	}
+	if len(p.Version) == 0 || string(p.Version) == "null" {
+		return "", nil
+	}
+	var v string
+	if err := json.Unmarshal(p.Version, &v); err != nil {
+		return "", fmt.Errorf("pack %s: version is not a string", path)
+	}
+	return v, nil
 }
 
 // handlerConfig is the pack served over ch: every tool the pack runs here is
